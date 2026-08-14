@@ -297,3 +297,106 @@ fn probe_installed_missing_package_reports_failure() {
         "error should point at logs: {msg}"
     );
 }
+
+#[test]
+fn probe_installed_config_not_found_gets_find_package_hint() {
+    // A.4: the probe's raw config-not-found error translates into the
+    // find-package hint, listing the config names actually installed in the
+    // probed prefixes (the googletest -> GTest shape).
+    let tmp = tempfile::tempdir().unwrap();
+    let prefix = tmp.path().join("prefix");
+    write(
+        &prefix.join("lib/cmake/GTest/GTestConfig.cmake"),
+        "# placeholder — never parsed, the probe fails before reading it\n",
+    );
+    let err = probe_installed(
+        "googletest",
+        &[prefix],
+        BuildConfig::Release,
+        &test_toolchain(),
+        &tmp.path().join("probe-work"),
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("find-package = \"<Name>\""),
+        "should carry the find-package hint: {msg}"
+    );
+    assert!(
+        msg.contains("GTest"),
+        "should list the installed config names: {msg}"
+    );
+    assert!(msg.contains("CMake logs"), "{msg}");
+}
+
+#[test]
+fn probe_system_not_found_offers_both_worlds() {
+    // §5.3: an uninstalled system dependency errors with both fixes —
+    // declare it fetched, or install it.
+    let tmp = tempfile::tempdir().unwrap();
+    let err = cppkg::probe::probe_system(
+        "definitely-not-a-system-pkg",
+        "definitely-not-a-system-pkg",
+        None,
+        &test_toolchain(),
+        &tmp.path().join("sysdep-work"),
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("found nothing on this machine"), "{msg}");
+    assert!(msg.contains("fetched dependency (git/url)"), "{msg}");
+    assert!(
+        msg.contains("brew install definitely-not-a-system-pkg"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn probe_system_extracts_zlib_when_present() {
+    // Smoke for the "cmake" resolution mode against a real machine package.
+    // ZLIB ships with every macOS SDK and every Arch install; if this
+    // machine genuinely has none, skip rather than fake a result.
+    let tmp = tempfile::tempdir().unwrap();
+    let result = cppkg::probe::probe_system(
+        "zlib",
+        "ZLIB",
+        Some("1.0"),
+        &test_toolchain(),
+        &tmp.path().join("sysdep-work"),
+    );
+    let (manifest, facts) = match result {
+        Ok(pair) => pair,
+        Err(e) => {
+            let msg = format!("{e:#}");
+            if msg.contains("found nothing on this machine") {
+                eprintln!("skipping: no system zlib on this machine");
+                return;
+            }
+            panic!("probe_system(ZLIB) failed: {msg}");
+        }
+    };
+    let comp = manifest
+        .components
+        .get("ZLIB::ZLIB")
+        .expect("FindZLIB should import ZLIB::ZLIB");
+    // The single machine artifact is replicated across configs so any
+    // consumer config links the file the sysdep hash describes.
+    assert_eq!(comp.location.get("Release"), comp.location.get("Debug"));
+    assert!(
+        !facts.library_paths.is_empty(),
+        "resolved libraries should be recorded"
+    );
+    assert_eq!(facts.library_paths.len(), facts.library_hashes.len());
+    assert!(
+        facts.library_hashes.iter().all(|h| h.starts_with("blake3:")),
+        "{:?}",
+        facts.library_hashes
+    );
+    let mut sorted = facts.library_paths.clone();
+    sorted.sort();
+    assert_eq!(facts.library_paths, sorted, "paths must be sorted");
+    assert!(
+        !facts.resolved_version.is_empty(),
+        "FindZLIB reports ZLIB_VERSION"
+    );
+}

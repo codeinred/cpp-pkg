@@ -154,6 +154,31 @@ charter and flag ambiguities + expensive-to-reverse decisions prominently
 in MORNING_REPORT.md, which the user reviews in depth. Commit + push
 (github.com/codeinred/cpp-pkg) after every stable point.
 
+## Wave-1 integration (2026-08-14)
+
+All 9 implementer bundles + integration landed; gate green: cargo
+build/test (390 tests)/clippy clean, four tests/projects green on fresh
+stores with byte-identical lockfiles, smoke battery per feature family
+passed (see wave report in the session). New CLI: test / install / gen
+[--check] / hidden gen-exec; build gains --prefix and
+--allow-undeclared-system-libs. Integration-owned judgment calls worth
+remembering:
+- `[flags]` ABI words are injected via the *effective profile* head
+  (cli::effective_profile), not a separate layer-2 channel — reuses all
+  v0 ABI machinery; deviation from §1.3's literal layer position.
+- ninja gen-edge outputs are spelled ABSOLUTE so compiler depfiles
+  connect to producing edges (relative spelling left a one-build
+  staleness window — caught by live smoke, fixed in ninja_gen.rs).
+- shim emitter unions system_includes into INTERFACE_INCLUDE_DIRECTORIES
+  (CMake's SYSTEM property marks, never adds; post-A.1 shims otherwise
+  exported zero include dirs — caught by provider-consumer).
+- Eager locking: url deps lock on first provisioning only (content hash
+  needs bytes); git tags resolve via ls-remote at lock time.
+- Hermeticity scan allow-list includes the SDK sysroot (sdk_version is
+  hashed) — curl's SDK zlib records make this load-bearing.
+- A.10 per-config build dirs deferred: ninja derives roots from
+  `<root>/build`; give write_ninja explicit roots before changing that.
+
 ## Notes to future me (things I care about)
 
 - The corpus-driven paradigm is the project's soul now: features come from

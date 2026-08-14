@@ -1,9 +1,19 @@
 //! `CppPkg.lock` — grammar is lockfile ABI, pinned in CPPKG_TOML.md:
-//!   source    = "git+<url>" | "url+<url>"
-//!   requested = "tag:<tag>" | "rev:<sha>" | "sha256:<hex>"
+//!   source    = "git+<url>" | "url+<url>" | "system"   (since wave 1)
+//!   requested = "tag:<tag>" | "rev:<sha>" | "sha256:<hex>" | "system"
 //!   commit present iff git (pin + integrity + re-download reference;
-//!     decided: the commit sha IS the content hash for git deps in v0)
+//!     decided: the commit sha IS the content hash for git deps in v0;
+//!     for patched deps it is always the BASE commit — never composed ids)
 //!   content-hash present iff url ("blake3:<hex>" of archive bytes)
+//!   patches (since wave 1, git/url only) = ["blake3:<hex>", ...] — one row
+//!     per declared patch file's bytes, in application order; present iff
+//!     declared. Drift against the current patch files re-resolves, by design.
+//!   min-version (since wave 1, system only) — the DECLARED constraint.
+//!     System rows record the declaration, never the machine (§5.3 coherence
+//!     ruling): resolved versions/paths/hashes live in the machine-local
+//!     sysdep store entry, keeping the lockfile committable from any machine.
+//! Locking is eager (every declared dep — dev, cfg-inactive, system — gets a
+//! row); provisioning is lazy and happens elsewhere.
 //! Written/updated on every resolve; `options`/`needs` deliberately absent.
 
 use std::collections::BTreeMap;
@@ -26,6 +36,12 @@ pub struct LockedPackage {
     pub requested: String,
     pub commit: Option<String>,
     pub content_hash: Option<String>,
+    /// "blake3:<hex>" of each declared patch file's bytes, application order.
+    /// Empty means absent from the file (git/url only; never on system rows).
+    pub patches: Vec<String>,
+    /// Declared version constraint on a system dep — machine-independent by
+    /// construction (the resolved version lives in the sysdep store entry).
+    pub min_version: Option<String>,
 }
 
 /// On-disk shape. Kept separate from the public types so the file format
@@ -49,6 +65,12 @@ struct PackageDoc {
     commit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content_hash: Option<String>,
+    // "present iff declared": an empty list serializes as no key at all, so
+    // v0 lockfiles and patch-free entries stay byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    patches: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_version: Option<String>,
 }
 
 /// Reject entries that don't satisfy the pinned grammar. A lockfile is ABI:
@@ -58,12 +80,54 @@ fn validate_entry(name: &str, pkg: &LockedPackage) -> Result<()> {
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
         bail!("lockfile: invalid package name {name:?} (allowed charset: [a-zA-Z0-9_-]+)");
     }
+    // System rows are pure declarations: any machine fact (a resolved
+    // version, a path, a hash) appearing here would make the lockfile churn
+    // per machine and a cfg-gated sysdep unlockable from another OS.
+    if pkg.source == "system" {
+        if pkg.requested != "system" {
+            bail!(
+                "lockfile: system package {name:?} has requested {:?} \
+                 (system rows use requested = \"system\")",
+                pkg.requested
+            );
+        }
+        if pkg.commit.is_some() || pkg.content_hash.is_some() {
+            bail!(
+                "lockfile: system package {name:?} must not have `commit` or `content-hash` \
+                 (machine facts never enter the lockfile; they live in the sysdep store entry)"
+            );
+        }
+        if !pkg.patches.is_empty() {
+            bail!(
+                "lockfile: system package {name:?} must not have `patches` \
+                 (system dependencies have no source tree to patch)"
+            );
+        }
+        return Ok(());
+    }
+    if pkg.min_version.is_some() {
+        bail!(
+            "lockfile: package {name:?} has `min-version` but is not a system dependency \
+             (min-version is a system-dep constraint)"
+        );
+    }
+    for row in &pkg.patches {
+        let ok = row
+            .strip_prefix("blake3:")
+            .is_some_and(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        if !ok {
+            bail!(
+                "lockfile: package {name:?} has invalid patches row {row:?} \
+                 (expected \"blake3:<lowercase hex>\")"
+            );
+        }
+    }
     let is_git = match pkg.source.split_once('+') {
         Some(("git", rest)) if !rest.is_empty() => true,
         Some(("url", rest)) if !rest.is_empty() => false,
         _ => bail!(
             "lockfile: package {name:?} has invalid source {:?} \
-             (expected \"git+<url>\" or \"url+<url>\")",
+             (expected \"git+<url>\", \"url+<url>\", or \"system\")",
             pkg.source
         ),
     };
@@ -128,6 +192,8 @@ impl Lockfile {
                 requested: p.requested,
                 commit: p.commit,
                 content_hash: p.content_hash,
+                patches: p.patches,
+                min_version: p.min_version,
             };
             validate_entry(&p.name, &entry)?;
             if packages.insert(p.name.clone(), entry).is_some() {
@@ -150,6 +216,8 @@ impl Lockfile {
                 requested: pkg.requested.clone(),
                 commit: pkg.commit.clone(),
                 content_hash: pkg.content_hash.clone(),
+                patches: pkg.patches.clone(),
+                min_version: pkg.min_version.clone(),
             });
         }
         let doc = LockDoc { schema_version: crate::SCHEMA_VERSION, packages: docs };
@@ -177,6 +245,9 @@ pub fn source_string(spec: &crate::schema::SourceSpec) -> String {
     match spec {
         SourceSpec::Git { url, .. } => format!("git+{url}"),
         SourceSpec::Url { url, .. } => format!("url+{url}"),
+        // Wave 1 (§5.3): the lock row records the declaration, never the
+        // machine, so the source string carries no URL/path at all.
+        SourceSpec::System { .. } => "system".to_string(),
     }
 }
 
@@ -186,6 +257,9 @@ pub fn requested_string(spec: &crate::schema::SourceSpec) -> String {
         SourceSpec::Git { reference: GitRef::Tag(tag), .. } => format!("tag:{tag}"),
         SourceSpec::Git { reference: GitRef::Rev(rev), .. } => format!("rev:{rev}"),
         SourceSpec::Url { sha256, .. } => format!("sha256:{sha256}"),
+        // System declarations carry their constraint in the `min-version`
+        // row, not in `requested`.
+        SourceSpec::System { .. } => "system".to_string(),
     }
 }
 
@@ -200,6 +274,8 @@ mod tests {
             requested: "tag:11.2.0".into(),
             commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
             content_hash: None,
+            patches: Vec::new(),
+            min_version: None,
         }
     }
 
@@ -209,6 +285,34 @@ mod tests {
             requested: "sha256:9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23".into(),
             commit: None,
             content_hash: Some("blake3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".into()),
+            patches: Vec::new(),
+            min_version: None,
+        }
+    }
+
+    fn patched_pkg() -> LockedPackage {
+        LockedPackage {
+            source: "git+https://github.com/abseil/abseil-cpp".into(),
+            requested: "rev:0123456789abcdef0123456789abcdef01234567".into(),
+            // Always the BASE commit, never the composed patched id.
+            commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            content_hash: None,
+            patches: vec![
+                format!("blake3:{}", "ab".repeat(32)),
+                format!("blake3:{}", "cd".repeat(32)),
+            ],
+            min_version: None,
+        }
+    }
+
+    fn system_pkg() -> LockedPackage {
+        LockedPackage {
+            source: "system".into(),
+            requested: "system".into(),
+            commit: None,
+            content_hash: None,
+            patches: Vec::new(),
+            min_version: Some("1.5".into()),
         }
     }
 
@@ -216,6 +320,8 @@ mod tests {
         let mut packages = BTreeMap::new();
         packages.insert("fmt".to_string(), git_pkg());
         packages.insert("zlib".to_string(), url_pkg());
+        packages.insert("absl".to_string(), patched_pkg());
+        packages.insert("zstd".to_string(), system_pkg());
         Lockfile { packages }
     }
 
@@ -307,11 +413,15 @@ mod tests {
             url: "https://zlib.net/zlib-1.3.1.tar.gz".into(),
             sha256: "deadbeef".into(),
         };
+        let system = SourceSpec::System { min_version: Some("1.5".into()) };
         assert_eq!(source_string(&git_tag), "git+https://github.com/fmtlib/fmt");
         assert_eq!(source_string(&url), "url+https://zlib.net/zlib-1.3.1.tar.gz");
         assert_eq!(requested_string(&git_tag), "tag:11.2.0");
         assert_eq!(requested_string(&git_rev), "rev:abc123");
         assert_eq!(requested_string(&url), "sha256:deadbeef");
+        // System declarations: constraint lives in min-version, never here.
+        assert_eq!(source_string(&system), "system");
+        assert_eq!(requested_string(&system), "system");
     }
 
     #[test]
@@ -359,6 +469,107 @@ mod tests {
         .unwrap();
         let err = Lockfile::load(&path).unwrap_err().to_string();
         assert!(err.contains("missing `commit`"), "got: {err}");
+    }
+
+    #[test]
+    fn lockfile_wave1_rows_render_iff_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CppPkg.lock");
+        sample().save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        // v0-shaped entries must not grow keys: "present iff declared".
+        let fmt_entry: String = {
+            let start = text.find("name = \"fmt\"").unwrap();
+            let rest = &text[start..];
+            let end = rest[1..].find("[[package]]").map(|i| i + 1).unwrap_or(rest.len());
+            rest[..end].to_string()
+        };
+        assert!(!fmt_entry.contains("patches"), "unpatched row grew a patches key:\n{fmt_entry}");
+        assert!(!fmt_entry.contains("min-version"), "{fmt_entry}");
+        // Wave-1 rows render with their pinned spellings.
+        assert!(text.contains("source = \"system\""));
+        assert!(text.contains("requested = \"system\""));
+        assert!(text.contains("min-version = \"1.5\""));
+        assert!(text.contains(&format!("patches = [\"blake3:{}\", \"blake3:{}\"]", "ab".repeat(32), "cd".repeat(32))));
+    }
+
+    #[test]
+    fn lockfile_system_row_invariants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CppPkg.lock");
+        let save_one = |name: &str, pkg: LockedPackage| {
+            let mut packages = BTreeMap::new();
+            packages.insert(name.to_string(), pkg);
+            Lockfile { packages }.save(&path).map(|_| ()).map_err(|e| e.to_string())
+        };
+
+        // Machine facts on a system row are the exact failure mode the
+        // coherence ruling forbids.
+        let mut bad = system_pkg();
+        bad.commit = Some("0123456789abcdef0123456789abcdef01234567".into());
+        let err = save_one("zstd", bad).unwrap_err();
+        assert!(err.contains("machine facts"), "got: {err}");
+
+        let mut bad = system_pkg();
+        bad.content_hash = Some("blake3:abcd".into());
+        let err = save_one("zstd", bad).unwrap_err();
+        assert!(err.contains("machine facts"), "got: {err}");
+
+        let mut bad = system_pkg();
+        bad.patches = vec![format!("blake3:{}", "ab".repeat(32))];
+        let err = save_one("zstd", bad).unwrap_err();
+        assert!(err.contains("no source tree to patch"), "got: {err}");
+
+        let mut bad = system_pkg();
+        bad.requested = "tag:1.5".into();
+        let err = save_one("zstd", bad).unwrap_err();
+        assert!(err.contains("requested = \"system\""), "got: {err}");
+
+        // min-version without a system source is meaningless.
+        let mut bad = git_pkg();
+        bad.min_version = Some("2.0".into());
+        let err = save_one("fmt", bad).unwrap_err();
+        assert!(err.contains("min-version"), "got: {err}");
+
+        // A system row without min-version is fine (constraint optional).
+        let mut ok = system_pkg();
+        ok.min_version = None;
+        save_one("zstd", ok).unwrap();
+    }
+
+    #[test]
+    fn lockfile_patches_row_format_enforced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CppPkg.lock");
+        for bad_row in ["deadbeef", "blake3:", "blake3:XYZ", "sha256:abcd", &format!("blake3:{}", "AB".repeat(32))] {
+            let mut bad = git_pkg();
+            bad.patches = vec![bad_row.to_string()];
+            let mut packages = BTreeMap::new();
+            packages.insert("fmt".to_string(), bad);
+            let err = Lockfile { packages }.save(&path).unwrap_err().to_string();
+            assert!(err.contains("patches row"), "row {bad_row:?} accepted: {err}");
+        }
+        // Patches are legal on url sources too (tarballs share the code path).
+        let mut ok = url_pkg();
+        ok.patches = vec![format!("blake3:{}", "ef".repeat(32))];
+        let mut packages = BTreeMap::new();
+        packages.insert("zlib".to_string(), ok);
+        Lockfile { packages }.save(&path).unwrap();
+    }
+
+    #[test]
+    fn lockfile_system_row_parses_from_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CppPkg.lock");
+        std::fs::write(
+            &path,
+            "schema-version = 1\n\n[[package]]\nname = \"zstd\"\nsource = \"system\"\nrequested = \"system\"\nmin-version = \"1.5\"\n",
+        )
+        .unwrap();
+        let lock = Lockfile::load(&path).unwrap().unwrap();
+        assert_eq!(lock.packages["zstd"], system_pkg());
+        // matching_entry works unchanged for system declarations.
+        assert!(lock.matching_entry("zstd", "system", "system").is_some());
     }
 
     #[test]

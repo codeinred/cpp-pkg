@@ -24,6 +24,7 @@ pub mod cmake_build;
 pub mod fetch;
 pub mod graph;
 pub mod hashing;
+pub mod interp;
 pub mod lockfile;
 pub mod manifest;
 pub mod ninja_gen;

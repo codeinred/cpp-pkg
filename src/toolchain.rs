@@ -84,6 +84,66 @@ impl ToolchainIdentity {
     }
 }
 
+impl ToolchainIdentity {
+    /// §2.1 cfg truth: what the current toolchain IS, on the two closed
+    /// axes. os comes from the target triple (the target answers "what am
+    /// I building *for*"): darwin => Macos; linux => Linux — gnu AND musl,
+    /// the libc field is deliberately ignored; windows/mingw/msvc =>
+    /// Windows. `clang` matches AppleClang (the googletest STREQUAL
+    /// footgun); GNU => Gcc. An os outside the closed vocabulary is a hard
+    /// error naming the triple — cfg must never silently evaluate against
+    /// a platform the vocabulary cannot express.
+    pub fn cfg_truth(&self) -> Result<crate::schema::CfgTruth> {
+        use crate::schema::CfgAtom;
+        let triple = self.target_triple.to_ascii_lowercase();
+        let os = if triple.contains("darwin") || triple.contains("macos") {
+            CfgAtom::Macos
+        } else if triple.contains("linux") {
+            CfgAtom::Linux
+        } else if triple.contains("windows") || triple.contains("mingw") || triple.contains("msvc")
+        {
+            CfgAtom::Windows
+        } else {
+            bail!(
+                "target triple `{}` has an OS outside the cfg vocabulary \
+                 (windows, macos, linux); cannot evaluate cfg predicates \
+                 for this toolchain",
+                self.target_triple
+            );
+        };
+        let compiler = match self.compiler_id.as_str() {
+            // AppleClang IS clang for conditional purposes — upstream
+            // manifests gate clang warning vocabulary, which Apple's build
+            // accepts identically.
+            "AppleClang" | "Clang" => CfgAtom::Clang,
+            "GNU" => CfgAtom::Gcc,
+            "MSVC" => CfgAtom::Msvc,
+            other => bail!(
+                "compiler id `{other}` has no cfg compiler atom \
+                 (clang, gcc, msvc)"
+            ),
+        };
+        Ok(crate::schema::CfgTruth { os, compiler })
+    }
+}
+
+/// §5.4: Threads::Threads expansion — (compile flags, link flags). A pure
+/// function of the §2.1 os axis, NOT the triple's libc field: glibc (any
+/// vintage) and musl want `-pthread` equally; darwin needs nothing (libc
+/// is pthreads); msvc needs nothing. Zero new hash inputs — the identity
+/// containing the triple is already hashed.
+pub fn threads_expansion(
+    os: crate::schema::CfgAtom,
+) -> (&'static [&'static str], &'static [&'static str]) {
+    match os {
+        crate::schema::CfgAtom::Linux => (&["-pthread"], &["-pthread"]),
+        // Macos/Windows: empty. Non-os atoms are a caller error; expanding
+        // to nothing is the safe answer (a missing -pthread is a link
+        // error, never a silent miscompile).
+        _ => (&[], &[]),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Toolchain {
     pub cxx: PathBuf,
@@ -162,6 +222,133 @@ pub fn detect_default() -> Result<Toolchain> {
     detect("c++")
 }
 
+/// Propagation classes for the wave-1 fence (wave1-extensions.md §1.2).
+/// The fence rejects only classes whose propagation through a public
+/// bucket is categorically wrong; everything unknown fails open (`Other`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlagClass {
+    /// The ABI table (extended): must live at [flags]/profile scope where
+    /// it propagates into dependency builds and config hashes; an error at
+    /// ANY target scope (§1.4).
+    Abi,
+    /// -fsanitize*: instrumentation the consumer chose; deps are
+    /// uninstrumented, propagation would lie.
+    Sanitizer,
+    /// -W… (except the -Wl,/-Wa,/-Wp, transports) and -w: "warnings are
+    /// private by nature; a library cannot volunteer its consumers into a
+    /// diagnostic policy".
+    Warning,
+    /// -O*, -g, -g[0-9], -ggdb*, -glldb*: "optimization level is the
+    /// consumer's (profile's) decision".
+    OptDebug,
+    /// Everything else, unknown included — the fence fails open.
+    Other,
+}
+
+/// One classified payload word, tied back to the argv word it came from so
+/// error messages can quote the user's spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifiedWord {
+    /// Index of the originating argv word. Two-argv transport forms
+    /// (-Xlinker <word>) attach the payload's classification to BOTH
+    /// indices so callers can report either half of the pair.
+    pub index: usize,
+    /// The unwrapped payload actually classified (e.g. "-D_GLIBCXX_DEBUG"
+    /// out of "-Wp,-D_GLIBCXX_DEBUG").
+    pub payload: String,
+    pub class: FlagClass,
+}
+
+/// Classify a flag list, unwrapping driver pass-through (transport)
+/// spellings BEFORE matching — the §1.2 laundering fix. `-Wl,`/`-Wa,`/
+/// `-Wp,` prefixes are stripped and their comma-separated payload words
+/// classified individually; the two-argv `-Xlinker`/`-Xpreprocessor`/
+/// `-Xassembler <word>` forms classify the following word. Transport is
+/// never itself Warning class — it is transport, not a warning — but it
+/// never launders ABI or sanitizer payloads past the fence either
+/// (`-Wp,-D_GLIBCXX_DEBUG` classifies Abi; `-Wl,-framework,X` stays
+/// Other).
+pub fn classify_word_sequence(flags: &[String]) -> Vec<ClassifiedWord> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < flags.len() {
+        let word = &flags[i];
+        if is_two_argv_transport(word) {
+            if let Some(payload_word) = flags.get(i + 1) {
+                // The payload's classification attaches to both argv
+                // indices: schema errors can then point at whichever word
+                // the user will recognize.
+                let classified = unwrap_and_classify(payload_word);
+                for (payload, class) in &classified {
+                    out.push(ClassifiedWord { index: i, payload: payload.clone(), class: *class });
+                }
+                for (payload, class) in classified {
+                    out.push(ClassifiedWord { index: i + 1, payload, class });
+                }
+                i += 2;
+                continue;
+            }
+            // Dangling transport (nothing follows): nothing to classify;
+            // the transport word itself fails open.
+            out.push(ClassifiedWord { index: i, payload: word.clone(), class: FlagClass::Other });
+            i += 1;
+            continue;
+        }
+        for (payload, class) in unwrap_and_classify(word) {
+            out.push(ClassifiedWord { index: i, payload, class });
+        }
+        i += 1;
+    }
+    out
+}
+
+fn is_two_argv_transport(word: &str) -> bool {
+    matches!(word, "-Xlinker" | "-Xpreprocessor" | "-Xassembler")
+}
+
+/// Strip a comma-transport prefix (if any) and classify each payload word;
+/// a plain word classifies as itself. Payload words cannot contain commas
+/// (the split consumed them), so one unwrap level suffices.
+fn unwrap_and_classify(word: &str) -> Vec<(String, FlagClass)> {
+    for prefix in ["-Wl,", "-Wa,", "-Wp,"] {
+        if let Some(rest) = word.strip_prefix(prefix) {
+            return rest
+                .split(',')
+                .map(|part| (part.to_string(), classify_plain_word(part)))
+                .collect();
+        }
+    }
+    vec![(word.to_string(), classify_plain_word(word))]
+}
+
+/// The class table for a single, already-unwrapped argv word. ABI first to
+/// keep v0 `classify_flags` semantics bit-identical (no member of the ABI
+/// table overlaps -fsanitize*, so the order only matters in principle).
+fn classify_plain_word(word: &str) -> FlagClass {
+    if is_abi_flag(word) {
+        return FlagClass::Abi;
+    }
+    if word.starts_with("-fsanitize") {
+        return FlagClass::Sanitizer;
+    }
+    // -Wl,/-Wa,/-Wp, spellings never reach here (unwrapped above), so any
+    // remaining -W… word is a real diagnostic flag.
+    if word == "-w" || word.starts_with("-W") {
+        return FlagClass::Warning;
+    }
+    if word.starts_with("-O") || word.starts_with("-ggdb") || word.starts_with("-glldb") {
+        return FlagClass::OptDebug;
+    }
+    if let Some(rest) = word.strip_prefix("-g") {
+        // Exactly -g or -g<digit>; -gdwarf-5 & friends are format
+        // selectors, not levels — they fail open per the spec table.
+        if rest.is_empty() || (rest.len() == 1 && rest.as_bytes()[0].is_ascii_digit()) {
+            return FlagClass::OptDebug;
+        }
+    }
+    FlagClass::Other
+}
+
 /// Classification of profile flags (CPPKG_TOML.md "Profiles and configs").
 #[derive(Debug, Clone, Default)]
 pub struct ClassifiedFlags {
@@ -171,18 +358,36 @@ pub struct ClassifiedFlags {
     pub abi: Vec<String>,
     /// Consumer-only.
     pub consumer_only: Vec<String>,
-    /// Subset of consumer_only that are -fsanitize=* (warning: deps are
+    /// Subset of consumer_only that are -fsanitize* (warning: deps are
     /// uninstrumented).
     pub sanitizers: Vec<String>,
 }
 
+/// v0 profile-scope split, reimplemented on `classify_word_sequence` so the
+/// ABI table exists exactly once. New over v0: transported ABI payloads
+/// (`-Wp,-D_GLIBCXX_DEBUG`, `-Xpreprocessor -D_GLIBCXX_DEBUG`) now land in
+/// the abi bucket — transport must not launder ABI past the config hash.
+/// Plain-word inputs classify bit-identically to v0 (no store keys move).
 pub fn classify_flags(flags: &[String]) -> ClassifiedFlags {
+    let words = classify_word_sequence(flags);
+    let mut has_abi = vec![false; flags.len()];
+    let mut has_san = vec![false; flags.len()];
+    for w in &words {
+        match w.class {
+            FlagClass::Abi => has_abi[w.index] = true,
+            FlagClass::Sanitizer => has_san[w.index] = true,
+            _ => {}
+        }
+    }
+    // Two-argv pairs carry the payload class on both indices, so both
+    // halves of "-Xpreprocessor -D_GLIBCXX_DEBUG" travel to the abi bucket
+    // together, in argv order.
     let mut out = ClassifiedFlags::default();
-    for flag in flags {
-        if is_abi_flag(flag) {
+    for (i, flag) in flags.iter().enumerate() {
+        if has_abi[i] {
             out.abi.push(flag.clone());
         } else {
-            if flag.starts_with("-fsanitize=") {
+            if has_san[i] {
                 out.sanitizers.push(flag.clone());
             }
             out.consumer_only.push(flag.clone());
@@ -683,6 +888,209 @@ mod tests {
     fn toolchain_classify_flags_empty() {
         let c = classify_flags(&[]);
         assert!(c.abi.is_empty() && c.consumer_only.is_empty() && c.sanitizers.is_empty());
+    }
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// One golden per §1.2 table row, plain-word spellings.
+    #[test]
+    fn toolchain_classify_word_sequence_plain_rows() {
+        use FlagClass::*;
+        let cases: &[(&str, FlagClass)] = &[
+            // ABI table
+            ("-D_GLIBCXX_DEBUG", Abi),
+            ("-D_GLIBCXX_ASSERTIONS", Abi),
+            ("-D_GLIBCXX_USE_CXX11_ABI=0", Abi),
+            ("-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST", Abi),
+            ("-stdlib=libc++", Abi),
+            ("-fabi-version=18", Abi),
+            ("-fclang-abi-compat=17", Abi),
+            // sanitizer (whole -fsanitize* family, not just -fsanitize=)
+            ("-fsanitize=address", Sanitizer),
+            ("-fsanitize-recover=all", Sanitizer),
+            ("-fsanitize-address-use-after-scope", Sanitizer),
+            // warning
+            ("-Wall", Warning),
+            ("-Werror", Warning),
+            ("-Wno-deprecated", Warning),
+            ("-w", Warning),
+            ("-Wthread-safety", Warning),
+            // opt/debug
+            ("-O0", OptDebug),
+            ("-O2", OptDebug),
+            ("-O", OptDebug),
+            ("-Os", OptDebug),
+            ("-Ofast", OptDebug),
+            ("-g", OptDebug),
+            ("-g0", OptDebug),
+            ("-g3", OptDebug),
+            ("-ggdb", OptDebug),
+            ("-ggdb3", OptDebug),
+            ("-glldb", OptDebug),
+            // fail open
+            ("-fno-exceptions", Other),
+            ("-pthread", Other),
+            ("-mavx2", Other),
+            ("-framework", Other),
+            ("-lrt", Other),
+            ("-gdwarf-5", Other),   // format selector, not a debug level
+            ("-D_GLIBCXX_DEBUG_BACKTRACE_EXTRA", Other), // alike, NOT exact
+            ("--totally-unknown", Other),
+        ];
+        for (flag, expected) in cases {
+            let got = classify_word_sequence(&s(&[flag]));
+            assert_eq!(
+                got,
+                vec![ClassifiedWord { index: 0, payload: flag.to_string(), class: *expected }],
+                "flag {flag}"
+            );
+        }
+    }
+
+    /// §1.2 laundering fix: comma transports are unwrapped and every
+    /// payload word classified individually; transport is never Warning.
+    #[test]
+    fn toolchain_classify_word_sequence_comma_transports() {
+        use FlagClass::*;
+        // The canonical laundering attempt: an ABI define smuggled through
+        // the preprocessor transport.
+        let got = classify_word_sequence(&s(&["-Wp,-D_GLIBCXX_DEBUG"]));
+        assert_eq!(
+            got,
+            vec![ClassifiedWord { index: 0, payload: "-D_GLIBCXX_DEBUG".into(), class: Abi }]
+        );
+
+        // Benign linker transport still passes: -framework is in no
+        // rejected class, and the -Wl, spelling is NOT Warning.
+        let got = classify_word_sequence(&s(&["-Wl,-framework,CoreFoundation"]));
+        assert_eq!(
+            got,
+            vec![
+                ClassifiedWord { index: 0, payload: "-framework".into(), class: Other },
+                ClassifiedWord { index: 0, payload: "CoreFoundation".into(), class: Other },
+            ]
+        );
+
+        // Sanitizer through the linker transport is caught too.
+        let got = classify_word_sequence(&s(&["-Wl,-fsanitize=address"]));
+        assert_eq!(got[0].class, Sanitizer);
+
+        // Assembler transport with a debug-level payload.
+        let got = classify_word_sequence(&s(&["-Wa,-g"]));
+        assert_eq!(
+            got,
+            vec![ClassifiedWord { index: 0, payload: "-g".into(), class: OptDebug }]
+        );
+
+        // Multi-word payloads keep per-word classes under one index.
+        let got = classify_word_sequence(&s(&["-Wl,--as-needed,-lrt"]));
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().all(|w| w.index == 0 && w.class == Other));
+    }
+
+    /// Two-argv transports classify the following word and attach the
+    /// class to BOTH indices (schema reports the user's spelling).
+    #[test]
+    fn toolchain_classify_word_sequence_two_argv_transports() {
+        use FlagClass::*;
+        let got = classify_word_sequence(&s(&["-Xpreprocessor", "-D_GLIBCXX_DEBUG", "-O2"]));
+        assert_eq!(
+            got,
+            vec![
+                ClassifiedWord { index: 0, payload: "-D_GLIBCXX_DEBUG".into(), class: Abi },
+                ClassifiedWord { index: 1, payload: "-D_GLIBCXX_DEBUG".into(), class: Abi },
+                ClassifiedWord { index: 2, payload: "-O2".into(), class: OptDebug },
+            ]
+        );
+
+        let got = classify_word_sequence(&s(&["-Xlinker", "-lfoo"]));
+        assert!(got.iter().all(|w| w.class == Other));
+        assert_eq!((got[0].index, got[1].index), (0, 1));
+
+        // -Xlinker payload that is itself a comma transport unwraps too.
+        let got = classify_word_sequence(&s(&["-Xlinker", "-Wl,-fsanitize=address"]));
+        assert!(got.iter().any(|w| w.class == Sanitizer));
+
+        // Dangling transport at end of list fails open, consumes one word.
+        let got = classify_word_sequence(&s(&["-Xlinker"]));
+        assert_eq!(
+            got,
+            vec![ClassifiedWord { index: 0, payload: "-Xlinker".into(), class: Other }]
+        );
+    }
+
+    /// classify_flags (profile scope) no longer lets transport launder ABI
+    /// or sanitizer payloads; plain words split exactly as in v0.
+    #[test]
+    fn toolchain_classify_flags_unwraps_transports() {
+        let c = classify_flags(&s(&[
+            "-Wp,-D_GLIBCXX_DEBUG",         // transported ABI -> abi bucket
+            "-Xpreprocessor",               // pair travels together...
+            "-D_GLIBCXX_ASSERTIONS",        // ...into the abi bucket
+            "-Wl,-framework,CoreFoundation", // benign -> consumer_only
+            "-Xlinker",                     // pair with sanitizer payload
+            "-fsanitize=thread",
+        ]));
+        assert_eq!(
+            c.abi,
+            s(&["-Wp,-D_GLIBCXX_DEBUG", "-Xpreprocessor", "-D_GLIBCXX_ASSERTIONS"])
+        );
+        assert_eq!(
+            c.consumer_only,
+            s(&["-Wl,-framework,CoreFoundation", "-Xlinker", "-fsanitize=thread"])
+        );
+        assert_eq!(c.sanitizers, s(&["-Xlinker", "-fsanitize=thread"]));
+    }
+
+    fn identity(compiler_id: &str, triple: &str) -> ToolchainIdentity {
+        ToolchainIdentity {
+            dialect: Dialect::Gnu,
+            compiler_id: compiler_id.into(),
+            version: "1.0.0".into(),
+            target_triple: triple.into(),
+            stdlib: "libc++".into(),
+            stdlib_version: "1".into(),
+            sdk_version: None,
+        }
+    }
+
+    #[test]
+    fn toolchain_cfg_truth_table() {
+        use crate::schema::CfgAtom;
+        // AppleClang => Clang (the STREQUAL footgun, §2.1).
+        let t = identity("AppleClang", "arm64-apple-darwin25.5.0").cfg_truth().unwrap();
+        assert!(matches!(t.os, CfgAtom::Macos));
+        assert!(matches!(t.compiler, CfgAtom::Clang));
+
+        // glibc and musl are both Linux — the libc field is ignored.
+        let t = identity("GNU", "x86_64-pc-linux-gnu").cfg_truth().unwrap();
+        assert!(matches!(t.os, CfgAtom::Linux));
+        assert!(matches!(t.compiler, CfgAtom::Gcc));
+        let t = identity("Clang", "x86_64-alpine-linux-musl").cfg_truth().unwrap();
+        assert!(matches!(t.os, CfgAtom::Linux));
+        assert!(matches!(t.compiler, CfgAtom::Clang));
+
+        let t = identity("GNU", "x86_64-w64-mingw32").cfg_truth().unwrap();
+        assert!(matches!(t.os, CfgAtom::Windows));
+
+        // Unknown os: hard error naming the triple.
+        let err = identity("Clang", "wasm32-unknown-wasi").cfg_truth().unwrap_err();
+        assert!(err.to_string().contains("wasm32-unknown-wasi"), "{err}");
+        // Unknown compiler id: hard error.
+        assert!(identity("TurboC", "x86_64-pc-linux-gnu").cfg_truth().is_err());
+    }
+
+    #[test]
+    fn toolchain_threads_expansion_table() {
+        use crate::schema::CfgAtom;
+        assert_eq!(
+            threads_expansion(CfgAtom::Linux),
+            (&["-pthread"][..], &["-pthread"][..])
+        );
+        assert_eq!(threads_expansion(CfgAtom::Macos), (&[][..], &[][..]));
+        assert_eq!(threads_expansion(CfgAtom::Windows), (&[][..], &[][..]));
     }
 
     #[test]

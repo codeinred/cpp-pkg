@@ -270,14 +270,40 @@ fn manifest_includes_sources_options() {
         rec("s::s", "INTERFACE_SOURCES", "/s/src/extra.cpp"),
     ]);
     let c = &m.components["s::s"];
+    // Wave-1 A.1: imported interface include dirs classify as SYSTEM at
+    // ingestion (declared order first, pre-marked system entries after).
+    assert!(c.includes.is_empty());
     assert_eq!(
-        c.includes,
-        vec![PathBuf::from("/s/include"), PathBuf::from("/s/other")]
+        c.system_includes,
+        vec![
+            PathBuf::from("/s/include"),
+            PathBuf::from("/s/other"),
+            PathBuf::from("/s/sys"),
+        ]
     );
-    assert_eq!(c.system_includes, vec![PathBuf::from("/s/sys")]);
     assert_eq!(c.compile_options, vec!["-fexceptions"]);
     assert_eq!(c.link_options, vec!["-Wl,-dead_strip"]);
     assert_eq!(c.interface_sources, vec![PathBuf::from("/s/src/extra.cpp")]);
+}
+
+#[test]
+fn manifest_interface_sources_skip_non_compilable() {
+    // Wave-1 A.3: headers and IDE metadata in extracted INTERFACE_SOURCES
+    // are skipped (CMake's own is-compilable classification); real sources
+    // stay. Project sources are unaffected — this is extraction-only.
+    let m = build(&[
+        rec("s::s", "TYPE", "INTERFACE_LIBRARY"),
+        rec(
+            "s::s",
+            "INTERFACE_SOURCES",
+            "/s/src/tz.cpp;/s/include/date/date.h;/s/misc/date.natvis;/s/src/ios.mm",
+        ),
+    ]);
+    assert_eq!(
+        m.components["s::s"].interface_sources,
+        vec![PathBuf::from("/s/src/tz.cpp"), PathBuf::from("/s/src/ios.mm")]
+    );
+    assert!(m.notes.is_empty());
 }
 
 #[test]
@@ -330,7 +356,9 @@ fn manifest_json_round_trip_stability() {
 
 #[test]
 fn manifest_save_load_manual_component() {
-    // A hand-built manifest (every field populated) survives a round trip.
+    // A hand-built manifest (every field populated) survives a round trip
+    // modulo the wave-1 ingestion transforms `load` applies (A.1 moves the
+    // includes bucket into system_includes on the way in).
     let comp = Component {
         kind: Some(ComponentKind::Dylib),
         location: BTreeMap::from([("Debug".to_string(), PathBuf::from("/s/lib/liba.dylib"))]),
@@ -356,7 +384,53 @@ fn manifest_save_load_manual_component() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("m.json");
     m.save(&path).unwrap();
-    assert_eq!(Manifest::load(&path).unwrap(), m);
+    let loaded = Manifest::load(&path).unwrap();
+    let mut expected = m.clone();
+    cppkg::manifest::apply_ingestion_transforms(&mut expected);
+    assert_eq!(loaded, expected);
+    // The transformed shape is a fixpoint: saving and re-loading it is exact.
+    loaded.save(&path).unwrap();
+    assert_eq!(Manifest::load(&path).unwrap(), loaded);
+}
+
+#[test]
+fn manifest_load_transforms_cached_v0_manifest() {
+    // A store manifest written by the v0 extractor (includes in the plain
+    // bucket, a literal Threads::Threads component and reference) converges
+    // on read: -isystem classification + builtin rewrite (spec A.1, §5.4).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("manifest.json");
+    std::fs::write(
+        &path,
+        r#"{
+  "schema_version": 1,
+  "name": "dep",
+  "components": {
+    "Threads::Threads": {
+      "type": "interface",
+      "link_options": ["-pthread"]
+    },
+    "dep::core": {
+      "type": "archive",
+      "location": { "Release": "/store/pkg/dep/install/lib/libcore.a" },
+      "includes": ["/store/pkg/dep/install/include"],
+      "requires": ["Threads::Threads", "dep::core"]
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    let m = Manifest::load(&path).unwrap();
+    assert!(!m.components.contains_key("Threads::Threads"));
+    let core = &m.components["dep::core"];
+    assert!(core.includes.is_empty());
+    assert_eq!(
+        core.system_includes,
+        vec![PathBuf::from("/store/pkg/dep/install/include")]
+    );
+    // Self-edge dropped, Threads reference rewritten to the builtin.
+    assert_eq!(core.requires, vec!["builtin:threads"]);
 }
 
 #[test]

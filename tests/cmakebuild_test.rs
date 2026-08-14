@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cppkg::cmake_build::{build_dependency, scrubbed_env, write_toolchain_file, DepBuildRequest};
-use cppkg::schema::{BuildConfig, DependencySpec, ExposesTargets, GitRef, SourceSpec};
+use cppkg::schema::{BuildConfig, DependencySpec};
 use cppkg::toolchain::{Dialect, Toolchain, ToolchainIdentity};
 
 /// Prefer the real detector; while it is still unimplemented (todo!()), fall
@@ -47,18 +47,24 @@ fn test_toolchain() -> Toolchain {
     }
 }
 
+/// Build a DependencySpec by parsing a manifest instead of a struct literal,
+/// so schema field additions in other bundles don't break this test file.
 fn dummy_spec(options: BTreeMap<String, String>) -> DependencySpec {
-    DependencySpec {
-        source: SourceSpec::Git {
-            url: "https://example.invalid/hello.git".to_string(),
-            reference: GitRef::Tag("v1.0.0".to_string()),
-        },
-        options,
-        needs: vec![],
-        find_package: None,
-        exposes_namespace: vec![],
-        exposes_targets: ExposesTargets::default(),
+    let mut toml = String::from(
+        "schema-version = 1\n\
+         [package]\nname = \"t\"\nversion = \"0.1.0\"\n\
+         [dependencies.hello]\n\
+         git = \"https://example.invalid/hello.git\"\n\
+         tag = \"v1.0.0\"\n",
+    );
+    if !options.is_empty() {
+        toml.push_str("[dependencies.hello.options]\n");
+        for (k, v) in &options {
+            toml.push_str(&format!("{k} = \"{v}\"\n"));
+        }
     }
+    let (project, _) = cppkg::schema::parse_str(&toml).expect("test manifest parses");
+    project.dependencies.get("hello").expect("hello dep").clone()
 }
 
 fn write_file(path: &Path, content: &str) {
@@ -215,6 +221,9 @@ fn cmakebuild_end_to_end_fixture() {
         toolchain: &tc,
         abi_flags: &[],
         prefix_path: &[],
+        subdir: None,
+        sysdep_allow: &[],
+        allow_undeclared_system_libs: false,
     };
     let built = build_dependency(&req).expect("fixture build should succeed");
     assert_eq!(built.dep_key, "hello");
@@ -264,6 +273,9 @@ install(TARGETS consumer RUNTIME DESTINATION bin)
         toolchain: &tc,
         abi_flags: &[],
         prefix_path: &prefixes,
+        subdir: None,
+        sysdep_allow: &[],
+        allow_undeclared_system_libs: false,
     };
     let consumer_built = build_dependency(&consumer_req).expect("consumer build should succeed");
     assert!(consumer_built.install_dir.join("bin/consumer").exists());
@@ -289,6 +301,9 @@ find_package(hello 99.0 REQUIRED)
         toolchain: &tc,
         abi_flags: &[],
         prefix_path: &prefixes,
+        subdir: None,
+        sysdep_allow: &[],
+        allow_undeclared_system_libs: false,
     };
     let err = build_dependency(&rejecting_req).expect_err("version mismatch must fail");
     let msg = format!("{err}");
@@ -328,6 +343,9 @@ find_package(CppkgNoSuchPkg REQUIRED)
         toolchain: &tc,
         abi_flags: &[],
         prefix_path: &[],
+        subdir: None,
+        sysdep_allow: &[],
+        allow_undeclared_system_libs: false,
     };
     let err = build_dependency(&req).expect_err("configure must fail");
     let msg = format!("{err}");
@@ -346,4 +364,60 @@ find_package(CppkgNoSuchPkg REQUIRED)
         "must include log path: {msg}"
     );
     assert!(log.exists(), "raw configure log must be preserved on failure");
+}
+
+/// A.5 (wave 1): a dep whose CMakeLists lives in a subdirectory of the
+/// checkout (the cpptrace-zstd `build/cmake` shape) configures from
+/// `<checkout>/<subdir>` and builds end-to-end; a wrong subdir errors before
+/// any cmake process is spawned, naming the missing CMakeLists.txt.
+#[test]
+fn cmakebuild_subdir_configure_root_end_to_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tc = test_toolchain();
+    let spec = dummy_spec(BTreeMap::new());
+
+    // The checkout root deliberately has NO CMakeLists.txt; the project
+    // lives under build/cmake, like zstd's.
+    let src = tmp.path().join("zstd-src");
+    write_hello_fixture(&src.join("build/cmake"));
+    let entry = tmp.path().join("store-entry");
+    let req = DepBuildRequest {
+        dep_key: "hello",
+        spec: &spec,
+        source_dir: &src,
+        config_hash: "deadbeef",
+        entry_dir: &entry,
+        config: BuildConfig::Release,
+        toolchain: &tc,
+        abi_flags: &[],
+        prefix_path: &[],
+        subdir: Some("build/cmake"),
+        sysdep_allow: &[],
+        allow_undeclared_system_libs: false,
+    };
+    let built = build_dependency(&req).expect("subdir build should succeed");
+    assert!(built.install_dir.join("lib/libhello.a").exists());
+    assert!(built.install_dir.join("include/hello.h").exists());
+
+    // Wrong subdir: clear error naming the path, no configure attempted
+    // (the entry dir keeps no build-tmp leftovers from a spawned cmake).
+    let bad_entry = tmp.path().join("bad-entry");
+    let bad = DepBuildRequest {
+        dep_key: "hello",
+        spec: &spec,
+        source_dir: &src,
+        config_hash: "deadbeef",
+        entry_dir: &bad_entry,
+        config: BuildConfig::Release,
+        toolchain: &tc,
+        abi_flags: &[],
+        prefix_path: &[],
+        subdir: Some("build/nope"),
+        sysdep_allow: &[],
+        allow_undeclared_system_libs: false,
+    };
+    let msg = build_dependency(&bad).expect_err("bad subdir must fail").to_string();
+    assert!(msg.contains("CMakeLists.txt"), "{msg}");
+    assert!(msg.contains("build/nope"), "{msg}");
+    assert!(!bad_entry.exists(), "no build tree may be created for a bad subdir");
 }

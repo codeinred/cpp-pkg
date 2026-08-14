@@ -19,12 +19,24 @@
 //!    store and prints the shim directory; the provider then find_package's
 //!    it (NO_DEFAULT_PATH) and marks the request satisfied. FetchContent
 //!    interception: deferred (FIND_PACKAGE only in v0).
+//! 3. Wave-1 (spec §6): install & export of the project's OWN targets — FHS
+//!    staging plan (`plan_install`/`execute_install`), a relocatable
+//!    `_IMPORT_PREFIX` Config over the exported targets, ConfigVersion with
+//!    SameMajorVersion semantics, `cppkg-manifest.json` with `@prefix@`
+//!    paths + requires rows (pins/options/patches), staged patch bytes,
+//!    derived public headers (§6.4), runtime data under `share/` (§6.5).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use anyhow::{bail, Context};
+
+use crate::lockfile::Lockfile;
 use crate::manifest::{Component, ComponentKind, Manifest};
+use crate::schema::{BuildConfig, ProjectFile, TargetKind};
 use crate::Result;
 
 /// Emit `<find_name>Config.cmake` (+ ConfigVersion) into `dir`; returns the
@@ -117,6 +129,19 @@ fn config_version_content() -> &'static str {
 }
 
 fn emit_component(out: &mut String, name: &str, component: &Component) {
+    emit_component_with(out, name, component, &escape_entry);
+}
+
+/// Property emission shared by the dependency shim (v0, `escape_entry`) and
+/// the wave-1 project export (`export_entry`, which rewrites the `@prefix@`
+/// placeholder to `${_IMPORT_PREFIX}`). One body so the property spelling —
+/// which probe.rs reads back for the round-trip invariant — exists once.
+fn emit_component_with(
+    out: &mut String,
+    name: &str,
+    component: &Component,
+    esc: &dyn Fn(&str) -> String,
+) {
     // UNKNOWN both for probed UNKNOWN imports and for components whose kind
     // was never recorded: CMake then treats any IMPORTED_LOCATION as a plain
     // link input, which is the safest reconstruction.
@@ -140,31 +165,42 @@ fn emit_component(out: &mut String, name: &str, component: &Component) {
             out,
             name,
             &format!("IMPORTED_LOCATION_{suffix}"),
-            &[escape_entry(&path.to_string_lossy())],
+            &[esc(&path.to_string_lossy())],
         );
-        imported_configs.push(escape_entry(&suffix));
+        imported_configs.push(esc(&suffix));
     }
     set_property(out, name, "IMPORTED_CONFIGURATIONS", &imported_configs);
 
+    // CMake's INTERFACE_SYSTEM_INCLUDE_DIRECTORIES only MARKS directories
+    // as system — it never adds them to the search path — so system dirs
+    // must also appear in INTERFACE_INCLUDE_DIRECTORIES. (Post-A.1 every
+    // imported include dir classifies as system; without the union, a
+    // consumer of the shim got no include dirs at all.)
+    let mut all_includes = component.includes.clone();
+    for p in &component.system_includes {
+        if !all_includes.contains(p) {
+            all_includes.push(p.clone());
+        }
+    }
     set_property(
         out,
         name,
         "INTERFACE_INCLUDE_DIRECTORIES",
-        &escape_paths(&component.includes),
+        &escape_paths_with(&all_includes, esc),
     );
     set_property(
         out,
         name,
         "INTERFACE_SYSTEM_INCLUDE_DIRECTORIES",
-        &escape_paths(&component.system_includes),
+        &escape_paths_with(&component.system_includes, esc),
     );
 
     let defines: Vec<String> = component
         .defines
         .iter()
         .map(|(key, value)| match value {
-            Some(v) => escape_entry(&format!("{key}={v}")),
-            None => escape_entry(key),
+            Some(v) => esc(&format!("{key}={v}")),
+            None => esc(key),
         })
         .collect();
     set_property(out, name, "INTERFACE_COMPILE_DEFINITIONS", &defines);
@@ -172,7 +208,7 @@ fn emit_component(out: &mut String, name: &str, component: &Component) {
     let compile_options: Vec<String> = component
         .compile_options
         .iter()
-        .map(|o| escape_entry(o))
+        .map(|o| esc(o))
         .collect();
     set_property(out, name, "INTERFACE_COMPILE_OPTIONS", &compile_options);
 
@@ -194,10 +230,10 @@ fn emit_component(out: &mut String, name: &str, component: &Component) {
     let mut link_options: Vec<String> = component
         .link_options
         .iter()
-        .map(|o| escape_entry(o))
+        .map(|o| esc(o))
         .collect();
     for framework in &component.frameworks {
-        link_options.push(escape_entry(&format!("SHELL:-framework {framework}")));
+        link_options.push(esc(&format!("SHELL:-framework {framework}")));
     }
     set_property(out, name, "INTERFACE_LINK_OPTIONS", &link_options);
 
@@ -205,26 +241,26 @@ fn emit_component(out: &mut String, name: &str, component: &Component) {
         out,
         name,
         "INTERFACE_SOURCES",
-        &escape_paths(&component.interface_sources),
+        &escape_paths_with(&component.interface_sources, esc),
     );
 
     // Order matters for the linker: requirements first, then raw artifact
     // paths, then system libs, then link-only edges.
     let mut link_libs: Vec<String> = Vec::new();
     for req in &component.requires {
-        link_libs.push(escape_entry(req));
+        link_libs.push(esc(req));
     }
     for path in &component.link_paths {
-        link_libs.push(escape_entry(&path.to_string_lossy()));
+        link_libs.push(esc(&path.to_string_lossy()));
     }
     for lib in &component.system_libs {
         // Bare name form: CMake itself lowers it to -l<name>. Tolerate an
         // already-prefixed entry rather than emitting a double prefix.
         let bare = lib.strip_prefix("-l").unwrap_or(lib);
-        link_libs.push(escape_entry(bare));
+        link_libs.push(esc(bare));
     }
     for req in &component.link_requires {
-        link_libs.push(format!("$<LINK_ONLY:{}>", escape_entry(req)));
+        link_libs.push(format!("$<LINK_ONLY:{}>", esc(req)));
     }
     set_property(out, name, "INTERFACE_LINK_LIBRARIES", &link_libs);
 
@@ -245,11 +281,20 @@ fn set_property(out: &mut String, target: &str, prop: &str, entries: &[String]) 
     );
 }
 
-fn escape_paths(paths: &[PathBuf]) -> Vec<String> {
-    paths
-        .iter()
-        .map(|p| escape_entry(&p.to_string_lossy()))
-        .collect()
+fn escape_paths_with(paths: &[PathBuf], esc: &dyn Fn(&str) -> String) -> Vec<String> {
+    paths.iter().map(|p| esc(&p.to_string_lossy())).collect()
+}
+
+/// Escape one entry for the wave-1 export Config: like `escape_entry`, but a
+/// leading `@prefix@` placeholder (the export manifest's prefix-relative
+/// spelling, §6.3) becomes an UNescaped `${_IMPORT_PREFIX}` variable
+/// reference — that variable expansion is the relocation mechanism, so it
+/// must survive where user data's `$` must not.
+fn export_entry(s: &str) -> String {
+    match s.strip_prefix(EXPORT_PREFIX_PLACEHOLDER) {
+        Some(rest) => format!("${{_IMPORT_PREFIX}}{}", escape_entry(rest)),
+        None => escape_entry(s),
+    }
 }
 
 /// Escape one ;-list element for inclusion inside a quoted CMake argument.
@@ -268,6 +313,989 @@ fn escape_entry(s: &str) -> String {
         }
     }
     out
+}
+
+// ===========================================================================
+// Wave-1 install & export (spec §6.2–6.5) — the project's OWN targets.
+//
+// SEAM NOTE (wave-1 concurrency): the implementation plan (§8 bundle brief)
+// has this module read graph::PlannedTarget's new export metadata and
+// schema's PublicHeaders/RuntimeData/ExportMeta types. Those deltas belong
+// to sibling bundles and had not landed while this module was written, so
+// `ExportTarget` / `PublicHeadersSpec` / `RuntimeDataSpec` / `ExportNames`
+// are field-for-field mirrors of that contract. The integration layer fills
+// them by copying the graph's already-cfg-projected effective values —
+// shim NEVER re-evaluates cfg (plan §8 invariant). Once the sibling types
+// exist, collapsing these mirrors onto them is a mechanical rename inside
+// this file plus one adapter at the call site.
+// ===========================================================================
+
+/// Prefix-relative path placeholder used in export manifests (§6.3: paths
+/// against `@prefix@`, CPS precedent). Rewritten to `${_IMPORT_PREFIX}` in
+/// the Config and substituted by the consumer of `cppkg-manifest.json`.
+pub const EXPORT_PREFIX_PLACEHOLDER: &str = "@prefix@";
+
+/// Header-extension set for derived public headers (§6.4). Exact,
+/// case-sensitive match — a `.HPP` file installs on neither platform, which
+/// keeps macOS (case-insensitive fs) and Linux agreeing on what ships.
+const HEADER_EXTENSIONS: [&str; 6] = ["h", "hpp", "hh", "hxx", "inc", "ipp"];
+
+/// Schema's `[export]` table (§6.1): cmake-name + namespace, both defaulted
+/// to the package name at load. Aliased so this module's export vocabulary
+/// reads uniformly.
+pub type ExportNames = crate::schema::ExportMeta;
+
+/// Schema's `public-headers` total override (§6.4); `base` is
+/// project-root-relative, patterns follow §0.4 (`!` negation).
+pub type PublicHeadersSpec = crate::schema::PublicHeaders;
+
+/// Schema's `runtime-data` entry (§6.5). Defaults (`patterns = ["**/*"]`,
+/// `to` = last component of `from`) are filled at schema load; empty values
+/// are re-defaulted here defensively for hand-built specs.
+pub type RuntimeDataSpec = crate::schema::RuntimeData;
+
+/// Mirror of PlannedTarget's wave-1 export metadata (implementation plan §2)
+/// plus the v0 fields shim reads (kind/output/local edges). All lists are
+/// the graph's effective (post-cfg, post-defaults) view.
+#[derive(Debug, Clone)]
+pub struct ExportTarget {
+    pub kind: TargetKind,
+    /// Build-dir-relative artifact path (PlannedTarget::output convention).
+    pub output: PathBuf,
+    pub install: bool,
+    pub dev: bool,
+    pub test: bool,
+    /// Absolute public include dirs (cfg-projected; may point into build/gen).
+    pub public_includes: Vec<PathBuf>,
+    pub public_defines: Vec<(String, Option<String>)>,
+    /// Public cxx-flags bucket, merged order.
+    pub public_flags: Vec<String>,
+    pub public_link_flags: Vec<String>,
+    pub cxx_std: Option<u32>,
+    pub public_headers: Option<PublicHeadersSpec>,
+    pub runtime_data: Vec<RuntimeDataSpec>,
+    /// Local sibling-target dependency edges, by visibility.
+    pub local_deps_public: Vec<String>,
+    pub local_deps_private: Vec<String>,
+    /// External component references (full exported names, e.g. "fmt::fmt"),
+    /// by propagation class.
+    pub external_public: Vec<String>,
+    pub external_link_only: Vec<String>,
+    /// Dependency keys owning the external components in this target's
+    /// closure (drives find_dependency + requires rows, §6.3).
+    pub external_dep_keys: BTreeSet<String>,
+}
+
+impl ExportTarget {
+    /// Empty metadata for a target of `kind` producing `output`; callers set
+    /// the fields they mean (mirrors how graph will fill PlannedTarget).
+    pub fn new(kind: TargetKind, output: impl Into<PathBuf>) -> ExportTarget {
+        ExportTarget {
+            kind,
+            output: output.into(),
+            install: false,
+            dev: false,
+            test: false,
+            public_includes: Vec::new(),
+            public_defines: Vec::new(),
+            public_flags: Vec::new(),
+            public_link_flags: Vec::new(),
+            cxx_std: None,
+            public_headers: None,
+            runtime_data: Vec::new(),
+            local_deps_public: Vec::new(),
+            local_deps_private: Vec::new(),
+            external_public: Vec::new(),
+            external_link_only: Vec::new(),
+            external_dep_keys: BTreeSet::new(),
+        }
+    }
+}
+
+/// Everything `manifest_from_project` reads (implementation-plan §8 contract
+/// shape, carried as one struct until graph's PlannedTarget fields land).
+#[derive(Debug, Clone)]
+pub struct ExportInputs<'a> {
+    pub package_name: &'a str,
+    /// `[package].version` — required as soon as a library is exported
+    /// (SameMajorVersion ConfigVersion, §6.3).
+    pub version: Option<&'a str>,
+    pub names: &'a ExportNames,
+    pub config: BuildConfig,
+    /// ALL planned targets by name (exported and not — closure checks need
+    /// the non-exported ones too).
+    pub targets: &'a BTreeMap<String, ExportTarget>,
+    /// Keys of `[dev-dependencies]` (§3.2: never exportable).
+    pub dev_dep_keys: &'a BTreeSet<String>,
+}
+
+/// Build the export manifest from the project's exported (install = true,
+/// non-dev) library targets. Closure rules (§6.3/§6.4) are enforced here:
+/// unexported local target in an exported library's closure, dev target or
+/// dev-dep-owned component in an exported closure, missing version while
+/// exporting a library, absolute paths in exported flags.
+pub fn manifest_from_project(x: &ExportInputs) -> Result<Manifest> {
+    validate_export(x)?;
+
+    let ns = &x.names.namespace;
+    let mut components = BTreeMap::new();
+    for (name, t) in x.targets {
+        if !t.install || t.kind != TargetKind::StaticLibrary {
+            continue;
+        }
+        let file = artifact_file_name(name, t)?;
+        let mut location = BTreeMap::new();
+        location.insert(
+            x.config.cmake_name().to_string(),
+            PathBuf::from(format!("{EXPORT_PREFIX_PLACEHOLDER}/lib/{file}")),
+        );
+
+        for flag in t.public_flags.iter().chain(&t.public_link_flags) {
+            if flag_smells_absolute(flag) {
+                bail!(
+                    "target '{name}': public flag '{flag}' embeds an absolute \
+                     path — exported manifests may not contain absolute paths \
+                     (hermeticity, spec §6.4)"
+                );
+            }
+        }
+
+        let mut requires: Vec<String> = t
+            .local_deps_public
+            .iter()
+            .map(|d| format!("{ns}::{d}"))
+            .collect();
+        requires.extend(t.external_public.iter().cloned());
+        // Private deps of a static library propagate link-only (§6.3: the
+        // $<LINK_ONLY:...> spelling probe.rs already reads).
+        let mut link_requires: Vec<String> = t
+            .local_deps_private
+            .iter()
+            .map(|d| format!("{ns}::{d}"))
+            .collect();
+        link_requires.extend(t.external_link_only.iter().cloned());
+
+        let component = Component {
+            kind: Some(ComponentKind::Archive),
+            location,
+            // All derived/declared headers install under include/ (§6.4), so
+            // the interface include dir is always exactly the prefix's.
+            includes: vec![PathBuf::from(format!("{EXPORT_PREFIX_PLACEHOLDER}/include"))],
+            defines: t.public_defines.clone(),
+            compile_options: t.public_flags.clone(),
+            cxx_std: t.cxx_std,
+            link_options: t.public_link_flags.clone(),
+            requires,
+            link_requires,
+            origin_find_name: x.names.cmake_name.clone(),
+            ..Default::default()
+        };
+        components.insert(format!("{ns}::{name}"), component);
+    }
+
+    Ok(Manifest {
+        package: x.package_name.to_string(),
+        components,
+        notes: Vec::new(),
+    })
+}
+
+fn artifact_file_name(name: &str, t: &ExportTarget) -> Result<String> {
+    match t.output.file_name() {
+        Some(f) => Ok(f.to_string_lossy().into_owned()),
+        None => bail!("target '{name}': output path {:?} has no file name", t.output),
+    }
+}
+
+/// Heuristic §6.4-end hermeticity check for flag words: rejects words that
+/// are, start dashed options with, or splice in an absolute path
+/// ("/opt/x", "-L/opt/x", "-Wl,-rpath,/opt/x", "-DX=/opt/x").
+fn flag_smells_absolute(word: &str) -> bool {
+    if word.starts_with('/') || word.contains("=/") || word.contains(",/") {
+        return true;
+    }
+    // Dashed single-letter path options fused with their argument: -L/x -I/x.
+    word.len() > 2 && word.starts_with('-') && word[2..].starts_with('/')
+}
+
+fn validate_export(x: &ExportInputs) -> Result<()> {
+    let mut exports_a_library = false;
+    for (name, t) in x.targets {
+        if !t.install {
+            continue;
+        }
+        if t.dev || t.test {
+            bail!(
+                "target '{name}': install = true on a dev/test target — dev \
+                 targets are excluded from export (spec §3.2/§6.4); drop the \
+                 marker or the install"
+            );
+        }
+        if t.kind == TargetKind::StaticLibrary {
+            exports_a_library = true;
+            validate_exported_closure(x, name)?;
+        }
+        // Dev-dep components can never ship, from any exported target.
+        for key in &t.external_dep_keys {
+            if x.dev_dep_keys.contains(key) {
+                bail!(
+                    "exported target '{name}' depends on components of \
+                     dev-dependency '{key}' — dev-dependencies are excluded \
+                     from export; move '{key}' to [dependencies] or remove \
+                     the edge"
+                );
+            }
+        }
+    }
+    if exports_a_library && x.version.is_none() {
+        bail!(
+            "exporting a library requires [package].version (the emitted \
+             ConfigVersion uses SameMajorVersion semantics); set \
+             [package].version or remove install = true from library targets"
+        );
+    }
+    Ok(())
+}
+
+/// §6.3 closure rule, for exported LIBRARIES: every local target reachable
+/// over dependency edges must itself be exported (its archive lands in the
+/// consumer's link line via the Config). Executables statically link their
+/// closure and impose no such rule.
+fn validate_exported_closure(x: &ExportInputs, root: &str) -> Result<()> {
+    let mut stack: Vec<&str> = vec![root];
+    let mut seen: BTreeSet<&str> = stack.iter().copied().collect();
+    while let Some(name) = stack.pop() {
+        let t = x
+            .targets
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!(
+                "internal: target '{name}' in export closure of '{root}' has \
+                 no planned metadata"
+            ))?;
+        if name != root {
+            if t.dev || t.test {
+                bail!(
+                    "exported target '{root}' depends on dev target '{name}' \
+                     — dev targets cannot appear in an exported closure \
+                     (spec §6.4)"
+                );
+            }
+            if !t.install {
+                bail!(
+                    "target '{name}' is in the exported closure of '{root}' \
+                     but is not installed — add install = true to '{name}' \
+                     or remove the edge"
+                );
+            }
+        }
+        for dep in t.local_deps_public.iter().chain(&t.local_deps_private) {
+            if seen.insert(dep) {
+                stack.push(dep);
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// §6.4 header derivation + §0.4 pattern expansion.
+// ---------------------------------------------------------------------------
+
+/// §0.4 expansion via the one shared implementation (graph::expand_patterns,
+/// per the implementation plan) with the export-side "empty is an error"
+/// policy applied (graph leaves the empty-total decision to callers).
+fn expand_patterns_at(
+    base: &Path,
+    patterns: &[String],
+    what: &str,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<PathBuf>> {
+    let files = crate::graph::expand_patterns(base, patterns, warnings)
+        .with_context(|| what.to_string())?;
+    if files.is_empty() {
+        bail!(
+            "{what}: patterns {patterns:?} expanded to no files under {}",
+            base.display()
+        );
+    }
+    Ok(files)
+}
+
+/// Derive the (source, include-relative destination) header set for one
+/// exported library (§6.4): `public-headers` is a TOTAL override expanded
+/// from its base; otherwise every header-shaped file under each public
+/// include dir ships at its dir-relative path. Empty derivation is a hard
+/// error naming the dirs.
+pub fn derive_headers(
+    name: &str,
+    t: &ExportTarget,
+    project_root: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut out: Vec<(PathBuf, PathBuf)> = Vec::new();
+    if let Some(ph) = &t.public_headers {
+        let base = project_root.join(&ph.base);
+        let what = format!("target '{name}': public-headers");
+        for src in expand_patterns_at(&base, &ph.patterns, &what, warnings)? {
+            let rel = src
+                .strip_prefix(&base)
+                .map(Path::to_path_buf)
+                .with_context(|| {
+                    format!("{what}: match {} escapes base {}", src.display(), base.display())
+                })?;
+            out.push((src, rel));
+        }
+    } else {
+        for dir in &t.public_includes {
+            if !dir.is_dir() {
+                // ${gen} dirs may not exist before the first build; surface,
+                // don't fail --list on a fresh tree.
+                warnings.push(format!(
+                    "target '{name}': public include dir {} does not exist; \
+                     no headers derived from it",
+                    dir.display()
+                ));
+                continue;
+            }
+            walk_headers(dir, dir, &mut out)
+                .with_context(|| format!("target '{name}': deriving headers"))?;
+        }
+        if out.is_empty() {
+            let dirs: Vec<String> = t
+                .public_includes
+                .iter()
+                .map(|d| d.display().to_string())
+                .collect();
+            bail!(
+                "target '{name}' is exported but its header derivation is \
+                 empty (public include dirs: [{}]) — add public headers, a \
+                 public-headers override, or remove install = true",
+                dirs.join(", ")
+            );
+        }
+    }
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    Ok(out)
+}
+
+/// Recursive walk collecting header-extension files as (source, rel-to-root)
+/// pairs. Symlinks (file or dir) are skipped, matching §6.4.
+fn walk_headers(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, PathBuf)>) -> Result<()> {
+    let mut entries: Vec<PathBuf> = fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<_>>()
+        .with_context(|| format!("reading {}", dir.display()))?;
+    entries.sort();
+    for path in entries {
+        let meta = fs::symlink_metadata(&path)
+            .with_context(|| format!("stat {}", path.display()))?;
+        if meta.is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            walk_headers(root, &path, out)?;
+        } else if let Some(ext) = path.extension().and_then(|e| e.to_str())
+            && HEADER_EXTENSIONS.contains(&ext)
+        {
+            let rel = path
+                .strip_prefix(root)
+                .expect("walked path is under its root")
+                .to_path_buf();
+            out.push((path, rel));
+        }
+    }
+    Ok(())
+}
+
+/// §6.5 runtime-data expansion for one target: (source, dest relative to
+/// share/<package>/) pairs. Missing `from` dir is a hard error; patterns
+/// default to `**/*`; `to` defaults to the last component of `from`.
+fn expand_runtime_data(
+    name: &str,
+    t: &ExportTarget,
+    project_root: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut out = Vec::new();
+    for rd in &t.runtime_data {
+        let from_dir = project_root.join(&rd.from);
+        if !from_dir.is_dir() {
+            bail!(
+                "target '{name}': runtime-data `from = \"{}\"` is not a \
+                 directory (looked at {})",
+                rd.from,
+                from_dir.display()
+            );
+        }
+        let default_patterns = vec!["**/*".to_string()];
+        let patterns = if rd.patterns.is_empty() {
+            &default_patterns
+        } else {
+            &rd.patterns
+        };
+        let to = if rd.to.is_empty() {
+            Path::new(&rd.from)
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| rd.from.clone())
+        } else {
+            rd.to.clone()
+        };
+        let what = format!("target '{name}': runtime-data '{}'", rd.from);
+        for src in expand_patterns_at(&from_dir, patterns, &what, warnings)? {
+            let rel = src
+                .strip_prefix(&from_dir)
+                .expect("runtime-data match is under its from dir")
+                .to_path_buf();
+            out.push((src, Path::new(&to).join(rel)));
+        }
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// §6.2 staging plan + execution.
+// ---------------------------------------------------------------------------
+
+/// One staged file: source -> PREFIX-RELATIVE destination.
+#[derive(Debug, Clone)]
+pub struct StageAction {
+    pub src: StageSource,
+    pub dest: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub enum StageSource {
+    /// Copy an existing file (build output, header, data file).
+    File(PathBuf),
+    /// Rendered text (Config / ConfigVersion / cppkg-manifest.json).
+    Rendered(String),
+    /// Raw bytes (staged patch files may be binary, §5.2).
+    Bytes(Vec<u8>),
+}
+
+#[derive(Debug, Clone)]
+pub struct InstallPlan {
+    pub prefix: PathBuf,
+    /// Sorted by destination; collision-free by construction.
+    pub actions: Vec<StageAction>,
+    pub warnings: Vec<String>,
+}
+
+impl InstallPlan {
+    /// `install --list` rendering: one prefix-relative line per action.
+    pub fn describe(&self) -> String {
+        let mut s = String::new();
+        for a in &self.actions {
+            let src = match &a.src {
+                StageSource::File(p) => p.display().to_string(),
+                StageSource::Rendered(_) => "(generated)".to_string(),
+                StageSource::Bytes(_) => "(patch bytes)".to_string(),
+            };
+            let _ = writeln!(s, "{}  <-  {}", a.dest.display(), src);
+        }
+        s
+    }
+}
+
+/// Pin + provenance row for one external dependency in
+/// `cppkg-manifest.json` (§6.3): lockfile identity, literal options, ordered
+/// patch ids whose bytes are staged beside the Config.
+#[derive(Debug, Clone, Default)]
+pub struct RequireRow {
+    pub source: String,
+    pub requested: String,
+    pub commit: Option<String>,
+    pub content_hash: Option<String>,
+    pub options: BTreeMap<String, String>,
+    pub patches: Vec<String>,
+}
+
+pub struct InstallRequest<'a> {
+    pub project: &'a ProjectFile,
+    pub export: &'a ExportInputs<'a>,
+    pub project_root: &'a Path,
+    pub build_dir: &'a Path,
+    /// Baked into NOTHING absolute — emission stays relocatable (§6.3).
+    pub prefix: &'a Path,
+    /// Requires rows read pins from here; an exported external dep with no
+    /// lock row is a hard error (resolve before install).
+    pub lockfile: &'a Lockfile,
+    /// dep key -> ordered ("blake3:<hex>", bytes) patch list (§5.2 spelling).
+    pub patch_bytes: &'a BTreeMap<String, Vec<(String, Vec<u8>)>>,
+    /// dep key -> machine-independent system-requirement declaration (§5.3:
+    /// declarations only, never resolved machine paths).
+    pub sysdeps: &'a BTreeMap<String, serde_json::Value>,
+    /// Empty = all exported targets.
+    pub targets: &'a [String],
+}
+
+/// Compute the full FHS staging plan (§6.2) without writing anything —
+/// `--list` prints it, `execute_install` performs it.
+pub fn plan_install(req: &InstallRequest) -> Result<InstallPlan> {
+    let x = req.export;
+    let full_manifest = manifest_from_project(x)?; // runs all export validation
+    let mut warnings = Vec::new();
+
+    // ---- selection: named targets (or all exported), closed over local
+    // dependency edges (closure members are exported per validation).
+    let mut selected: BTreeSet<String> = if req.targets.is_empty() {
+        x.targets
+            .iter()
+            .filter(|(_, t)| t.install)
+            .map(|(n, _)| n.clone())
+            .collect()
+    } else {
+        let mut sel = BTreeSet::new();
+        for name in req.targets {
+            let t = x.targets.get(name).ok_or_else(|| {
+                anyhow::anyhow!("install: unknown target '{name}'")
+            })?;
+            if !t.install {
+                bail!(
+                    "install: target '{name}' is not installed — mark it \
+                     install = true or drop it from the argument list"
+                );
+            }
+            sel.insert(name.clone());
+        }
+        sel
+    };
+    // Close over local edges (deterministic: iterate until fixpoint).
+    loop {
+        let mut added = Vec::new();
+        for name in &selected {
+            let t = &x.targets[name.as_str()];
+            for dep in t.local_deps_public.iter().chain(&t.local_deps_private) {
+                if !selected.contains(dep) {
+                    added.push(dep.clone());
+                }
+            }
+        }
+        if added.is_empty() {
+            break;
+        }
+        selected.extend(added);
+    }
+
+    // ---- collect destinations with byte-equal dedupe (§6.4/§6.5 rule).
+    let mut staged: BTreeMap<PathBuf, StageSource> = BTreeMap::new();
+    let mut add = |dest: PathBuf, src: StageSource| -> Result<()> {
+        match staged.get(&dest) {
+            None => {
+                staged.insert(dest, src);
+                Ok(())
+            }
+            Some(existing) => {
+                if stage_sources_equal(existing, &src)? {
+                    Ok(()) // byte-equal overlap dedupes (§6.4, §6.5)
+                } else {
+                    bail!(
+                        "install collision: two different sources stage to \
+                         '{}' — same destination requires byte-identical \
+                         content (spec §6.4/§6.5)",
+                        dest.display()
+                    )
+                }
+            }
+        }
+    };
+
+    let mut exported_lib_components: BTreeSet<String> = BTreeSet::new();
+    for name in &selected {
+        let t = &x.targets[name.as_str()];
+        let file = artifact_file_name(name, t)?;
+        let (subdir, is_lib) = match t.kind {
+            TargetKind::Executable => ("bin", false),
+            TargetKind::StaticLibrary => ("lib", true),
+        };
+        add(
+            Path::new(subdir).join(&file),
+            StageSource::File(req.build_dir.join(&t.output)),
+        )?;
+
+        if is_lib {
+            exported_lib_components.insert(format!("{}::{name}", x.names.namespace));
+            for (src, rel) in derive_headers(name, t, req.project_root, &mut warnings)? {
+                add(Path::new("include").join(rel), StageSource::File(src))?;
+            }
+        }
+
+        for (src, rel) in expand_runtime_data(name, t, req.project_root, &mut warnings)? {
+            add(
+                Path::new("share").join(x.package_name).join(rel),
+                StageSource::File(src),
+            )?;
+        }
+    }
+
+    // ---- export files (only when the selection ships a library).
+    if !exported_lib_components.is_empty() {
+        let mut manifest = full_manifest.clone();
+        manifest
+            .components
+            .retain(|name, _| exported_lib_components.contains(name));
+
+        let mut dep_keys: BTreeSet<&String> = BTreeSet::new();
+        for name in &selected {
+            dep_keys.extend(&x.targets[name.as_str()].external_dep_keys);
+        }
+
+        let mut requires: BTreeMap<String, RequireRow> = BTreeMap::new();
+        let mut find_names: BTreeSet<String> = BTreeSet::new();
+        for key in &dep_keys {
+            if req.sysdeps.contains_key(*key) {
+                // System deps serialize as system requirements (§6.3), not
+                // as pin rows; their find name still enters the Config.
+                find_names.insert(dep_find_name(req.project, key));
+                continue;
+            }
+            let locked = req.lockfile.packages.get(*key).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "install: dependency '{key}' is in the exported closure \
+                     but has no CppPkg.lock entry — run a build/resolve first"
+                )
+            })?;
+            let options = req
+                .project
+                .dependencies
+                .get(*key)
+                .map(|d| d.options.clone())
+                .unwrap_or_default();
+            let patches: Vec<String> = req
+                .patch_bytes
+                .get(*key)
+                .map(|v| v.iter().map(|(id, _)| id.clone()).collect())
+                .unwrap_or_default();
+            requires.insert(
+                (*key).clone(),
+                RequireRow {
+                    source: locked.source.clone(),
+                    requested: locked.requested.clone(),
+                    commit: locked.commit.clone(),
+                    content_hash: locked.content_hash.clone(),
+                    options,
+                    patches,
+                },
+            );
+            find_names.insert(dep_find_name(req.project, key));
+        }
+        // The Threads builtin (§5.4) needs FindThreads at consume time but
+        // is no dependency: find_dependency only, no requires row.
+        if manifest_mentions(&manifest, "Threads::Threads") {
+            find_names.insert("Threads".to_string());
+        }
+
+        let system_requires: BTreeMap<String, serde_json::Value> = req
+            .sysdeps
+            .iter()
+            .filter(|(k, _)| dep_keys.contains(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        let find_dependencies: Vec<String> = find_names.into_iter().collect();
+        let rendered = render_export_files(&ExportRenderInputs {
+            package_name: x.package_name,
+            names: x.names,
+            manifest: &manifest,
+            version: x.version,
+            find_dependencies: &find_dependencies,
+            requires: &requires,
+            system_requires: &system_requires,
+        })?;
+        for (rel, content) in rendered {
+            add(rel, StageSource::Rendered(content))?;
+        }
+
+        // Patch bytes staged beside the Config, named by their blake3 id
+        // (§6.3: the pin alone cannot reproduce a patched dependency).
+        let patches_dir = Path::new("lib")
+            .join("cmake")
+            .join(&x.names.cmake_name)
+            .join("patches");
+        for key in &dep_keys {
+            let Some(entries) = req.patch_bytes.get(*key) else {
+                continue;
+            };
+            for (id, bytes) in entries {
+                let hex = id.strip_prefix("blake3:").ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "install: patch id '{id}' for dependency '{key}' is \
+                         not in the lockfile 'blake3:<hex>' spelling"
+                    )
+                })?;
+                add(
+                    patches_dir.join(format!("{hex}.patch")),
+                    StageSource::Bytes(bytes.clone()),
+                )?;
+            }
+        }
+    }
+
+    Ok(InstallPlan {
+        prefix: req.prefix.to_path_buf(),
+        actions: staged
+            .into_iter()
+            .map(|(dest, src)| StageAction { src, dest })
+            .collect(),
+        warnings,
+    })
+}
+
+fn dep_find_name(project: &ProjectFile, key: &str) -> String {
+    project
+        .dependencies
+        .get(key)
+        .and_then(|d| d.find_package.clone())
+        .unwrap_or_else(|| key.to_string())
+}
+
+fn manifest_mentions(m: &Manifest, reference: &str) -> bool {
+    m.components.values().any(|c| {
+        c.requires.iter().any(|r| r == reference)
+            || c.link_requires.iter().any(|r| r == reference)
+    })
+}
+
+fn stage_sources_equal(a: &StageSource, b: &StageSource) -> Result<bool> {
+    let bytes = |s: &StageSource| -> Result<Vec<u8>> {
+        Ok(match s {
+            StageSource::File(p) => fs::read(p)
+                .with_context(|| format!("reading staged source {}", p.display()))?,
+            StageSource::Rendered(t) => t.as_bytes().to_vec(),
+            StageSource::Bytes(b) => b.clone(),
+        })
+    };
+    Ok(bytes(a)? == bytes(b)?)
+}
+
+/// Execute a staging plan. `destdir` composes as `<destdir><prefix>` while
+/// every rendered path keeps referring to `<prefix>` — the distro-packaging
+/// contract (§6.2). Overwrite-by-default, idempotent, never deletes.
+pub fn execute_install(plan: &InstallPlan, destdir: Option<&Path>) -> Result<()> {
+    let root = match destdir {
+        Some(d) => match plan.prefix.strip_prefix("/") {
+            Ok(rel) => d.join(rel),
+            Err(_) => d.join(&plan.prefix),
+        },
+        None => plan.prefix.clone(),
+    };
+    for action in &plan.actions {
+        let dest = root.join(&action.dest);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        match &action.src {
+            StageSource::File(src) => {
+                fs::copy(src, &dest).with_context(|| {
+                    format!(
+                        "installing {} -> {} (is the project built?)",
+                        src.display(),
+                        dest.display()
+                    )
+                })?;
+            }
+            StageSource::Rendered(text) => {
+                fs::write(&dest, text)
+                    .with_context(|| format!("writing {}", dest.display()))?;
+            }
+            StageSource::Bytes(bytes) => {
+                fs::write(&dest, bytes)
+                    .with_context(|| format!("writing {}", dest.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// §6.3 export-file rendering.
+// ---------------------------------------------------------------------------
+
+pub struct ExportRenderInputs<'a> {
+    pub package_name: &'a str,
+    pub names: &'a ExportNames,
+    /// Export manifest with `@prefix@` paths (from `manifest_from_project`,
+    /// possibly filtered to an install selection).
+    pub manifest: &'a Manifest,
+    pub version: Option<&'a str>,
+    /// find_package names for `find_dependency(...)` lines, sorted.
+    pub find_dependencies: &'a [String],
+    pub requires: &'a BTreeMap<String, RequireRow>,
+    pub system_requires: &'a BTreeMap<String, serde_json::Value>,
+}
+
+/// Render the three export files (§6.3), as (prefix-relative path, content):
+/// `<CmakeName>Config.cmake` (relocatable `_IMPORT_PREFIX`),
+/// `<CmakeName>ConfigVersion.cmake` (SameMajorVersion — requires a version
+/// when the manifest exports any component), `cppkg-manifest.json`.
+pub fn render_export_files(r: &ExportRenderInputs) -> Result<Vec<(PathBuf, String)>> {
+    let cmake_dir = Path::new("lib").join("cmake").join(&r.names.cmake_name);
+    let mut out = Vec::new();
+
+    // --- Config.cmake
+    let mut cfg = String::new();
+    let _ = writeln!(
+        cfg,
+        "# Generated by cpp-pkg: export Config for package '{}'.\n\
+         # Recreates this project's exported targets as IMPORTED targets.\n\
+         # Relocatable: all paths derive from this file's location. Do not edit.",
+        r.package_name
+    );
+    // <prefix>/lib/cmake/<Name>/<Name>Config.cmake -> four PATH pops reach
+    // the prefix (CMake's own install(EXPORT) pattern).
+    cfg.push_str(
+        "\nget_filename_component(_IMPORT_PREFIX \"${CMAKE_CURRENT_LIST_FILE}\" PATH)\n\
+         get_filename_component(_IMPORT_PREFIX \"${_IMPORT_PREFIX}\" PATH)\n\
+         get_filename_component(_IMPORT_PREFIX \"${_IMPORT_PREFIX}\" PATH)\n\
+         get_filename_component(_IMPORT_PREFIX \"${_IMPORT_PREFIX}\" PATH)\n\
+         if(_IMPORT_PREFIX STREQUAL \"/\")\n\
+         \x20\x20set(_IMPORT_PREFIX \"\")\n\
+         endif()\n",
+    );
+    if !r.find_dependencies.is_empty() {
+        cfg.push_str("\ninclude(CMakeFindDependencyMacro)\n");
+        for name in r.find_dependencies {
+            let _ = writeln!(cfg, "find_dependency({name})");
+        }
+    }
+    for (name, component) in &r.manifest.components {
+        emit_component_with(&mut cfg, name, component, &export_entry);
+    }
+    cfg.push_str("\nset(_IMPORT_PREFIX)\n");
+    out.push((
+        cmake_dir.join(format!("{}Config.cmake", r.names.cmake_name)),
+        cfg,
+    ));
+
+    // --- ConfigVersion.cmake
+    let version = match r.version {
+        Some(v) => v,
+        None if r.manifest.components.is_empty() => "0",
+        None => bail!(
+            "rendering an export Config with components requires \
+             [package].version (SameMajorVersion ConfigVersion)"
+        ),
+    };
+    out.push((
+        cmake_dir.join(format!("{}ConfigVersion.cmake", r.names.cmake_name)),
+        config_version_same_major(version),
+    ));
+
+    // --- cppkg-manifest.json
+    out.push((
+        cmake_dir.join("cppkg-manifest.json"),
+        export_manifest_json(r.manifest, r.requires, r.system_requires)?,
+    ));
+
+    Ok(out)
+}
+
+/// SameMajorVersion ConfigVersion semantics (§6.3): compatible iff the
+/// requested major equals ours and the request is not newer; exact on string
+/// equality; a version-less find_package request always passes.
+fn config_version_same_major(version: &str) -> String {
+    format!(
+        "# Generated by cpp-pkg. SameMajorVersion compatibility.\n\
+         set(PACKAGE_VERSION \"{version}\")\n\
+         if(\"{version}\" MATCHES \"^([0-9]+)\")\n\
+         \x20\x20set(_cppkg_version_major \"${{CMAKE_MATCH_1}}\")\n\
+         else()\n\
+         \x20\x20set(_cppkg_version_major \"{version}\")\n\
+         endif()\n\
+         if(\"${{PACKAGE_FIND_VERSION}}\" STREQUAL \"\")\n\
+         \x20\x20set(PACKAGE_VERSION_COMPATIBLE TRUE)\n\
+         elseif(PACKAGE_VERSION VERSION_LESS PACKAGE_FIND_VERSION)\n\
+         \x20\x20set(PACKAGE_VERSION_COMPATIBLE FALSE)\n\
+         elseif(NOT \"${{PACKAGE_FIND_VERSION_MAJOR}}\" STREQUAL \"${{_cppkg_version_major}}\")\n\
+         \x20\x20set(PACKAGE_VERSION_COMPATIBLE FALSE)\n\
+         else()\n\
+         \x20\x20set(PACKAGE_VERSION_COMPATIBLE TRUE)\n\
+         \x20\x20if(PACKAGE_FIND_VERSION STREQUAL PACKAGE_VERSION)\n\
+         \x20\x20\x20\x20set(PACKAGE_VERSION_EXACT TRUE)\n\
+         \x20\x20endif()\n\
+         endif()\n"
+    )
+}
+
+/// The CPS-shaped component manifest (via `Manifest::save`'s canonical
+/// serialization) extended with `requires` / `system-requires` sections.
+fn export_manifest_json(
+    m: &Manifest,
+    requires: &BTreeMap<String, RequireRow>,
+    system_requires: &BTreeMap<String, serde_json::Value>,
+) -> Result<String> {
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&manifest_json_string(m)?).context("re-reading export manifest")?;
+    let obj = doc
+        .as_object_mut()
+        .expect("Manifest::save writes a JSON object");
+    if !requires.is_empty() {
+        let rows: serde_json::Map<String, serde_json::Value> = requires
+            .iter()
+            .map(|(k, r)| (k.clone(), require_row_json(r)))
+            .collect();
+        obj.insert("requires".to_string(), serde_json::Value::Object(rows));
+    }
+    if !system_requires.is_empty() {
+        let rows: serde_json::Map<String, serde_json::Value> = system_requires
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        obj.insert(
+            "system-requires".to_string(),
+            serde_json::Value::Object(rows),
+        );
+    }
+    let mut text = serde_json::to_string_pretty(&doc).context("encoding cppkg-manifest.json")?;
+    text.push('\n');
+    Ok(text)
+}
+
+fn require_row_json(r: &RequireRow) -> serde_json::Value {
+    let mut row = serde_json::Map::new();
+    row.insert("source".to_string(), r.source.clone().into());
+    row.insert("requested".to_string(), r.requested.clone().into());
+    if let Some(c) = &r.commit {
+        row.insert("commit".to_string(), c.clone().into());
+    }
+    if let Some(h) = &r.content_hash {
+        row.insert("content-hash".to_string(), h.clone().into());
+    }
+    if !r.options.is_empty() {
+        let opts: serde_json::Map<String, serde_json::Value> = r
+            .options
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone().into()))
+            .collect();
+        row.insert("options".to_string(), serde_json::Value::Object(opts));
+    }
+    if !r.patches.is_empty() {
+        row.insert(
+            "patches".to_string(),
+            serde_json::Value::Array(r.patches.iter().map(|p| p.clone().into()).collect()),
+        );
+    }
+    serde_json::Value::Object(row)
+}
+
+/// Serialize a manifest through its one canonical writer (`Manifest::save`)
+/// via a scratch file. SEAM: replace with `manifest::to_json_string` when
+/// the manifest bundle exposes one (reported cross-module need).
+fn manifest_json_string(m: &Manifest) -> Result<String> {
+    static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "cppkg-export-{}-{}.json",
+        std::process::id(),
+        SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    m.save(&path)?;
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("re-reading {}", path.display()));
+    let _ = fs::remove_file(&path);
+    text
 }
 
 #[cfg(test)]
@@ -488,9 +1516,11 @@ endforeach()
         );
 
         assert_eq!(get("demo::hdr", "TYPE"), "INTERFACE_LIBRARY");
+        // System dirs ride INTERFACE_INCLUDE_DIRECTORIES too (the SYSTEM
+        // property marks, it does not add).
         assert_eq!(
             get("demo::hdr", "INTERFACE_INCLUDE_DIRECTORIES"),
-            "/store/include"
+            "/store/include;/store/sys"
         );
         assert_eq!(
             get("demo::hdr", "INTERFACE_SYSTEM_INCLUDE_DIRECTORIES"),
@@ -505,6 +1535,850 @@ endforeach()
         assert_eq!(
             get("demo::hidden", "IMPORTED_LOCATION_RELEASE"),
             "/store/lib/libhidden.a"
+        );
+    }
+}
+
+#[cfg(test)]
+// Same fixture style as `tests` above: Components and ExportTargets are
+// built field-by-field because only the populated fields matter.
+#[allow(clippy::field_reassign_with_default)]
+mod export_tests {
+    use super::*;
+    use crate::schema::parse_str;
+    use std::process::Command;
+
+    // ---- fixtures -------------------------------------------------------
+
+    fn demo_names() -> ExportNames {
+        ExportNames {
+            cmake_name: "demo".to_string(),
+            namespace: "demo".to_string(),
+        }
+    }
+
+    fn demo_project() -> ProjectFile {
+        parse_str(
+            r#"schema-version = 1
+
+[package]
+name = "demo"
+version = "1.9.5"
+
+[dependencies.zstd]
+git = "https://example.com/zstd"
+tag = "v1.5.6"
+
+[targets.core]
+type = "static-library"
+sources = ["src/*.cpp"]
+"#,
+        )
+        .unwrap()
+        .0
+    }
+
+    fn demo_lockfile(dir: &Path) -> Lockfile {
+        let path = dir.join("CppPkg.lock");
+        fs::write(
+            &path,
+            "schema-version = 1\n\n\
+             [[package]]\n\
+             name = \"zstd\"\n\
+             source = \"git+https://example.com/zstd\"\n\
+             requested = \"tag:v1.5.6\"\n\
+             commit = \"0123456789abcdef0123456789abcdef01234567\"\n",
+        )
+        .unwrap();
+        Lockfile::load(&path).unwrap().unwrap()
+    }
+
+    fn lib(output: &str) -> ExportTarget {
+        let mut t = ExportTarget::new(TargetKind::StaticLibrary, output);
+        t.install = true;
+        t
+    }
+
+    fn exe(output: &str) -> ExportTarget {
+        let mut t = ExportTarget::new(TargetKind::Executable, output);
+        t.install = true;
+        t
+    }
+
+    fn inputs<'a>(
+        names: &'a ExportNames,
+        targets: &'a BTreeMap<String, ExportTarget>,
+        dev_deps: &'a BTreeSet<String>,
+    ) -> ExportInputs<'a> {
+        ExportInputs {
+            package_name: "demo",
+            version: Some("1.9.5"),
+            names,
+            config: BuildConfig::Release,
+            targets,
+            dev_dep_keys: dev_deps,
+        }
+    }
+
+    // ---- manifest_from_project ------------------------------------------
+
+    #[test]
+    fn shim_export_manifest_shape() {
+        let names = demo_names();
+        let empty = BTreeSet::new();
+        let mut targets = BTreeMap::new();
+        let mut core = lib("libcore.a");
+        core.public_includes = vec![PathBuf::from("/proj/include/api")];
+        core.public_defines = vec![("CORE_FLAG".into(), None)];
+        core.public_flags = vec!["-fno-exceptions".into()];
+        core.cxx_std = Some(17);
+        core.local_deps_public = vec!["hdr".into()];
+        core.local_deps_private = vec!["impl".into()];
+        core.external_public = vec!["zstd::libzstd".into()];
+        core.external_dep_keys = BTreeSet::from(["zstd".to_string()]);
+        targets.insert("core".to_string(), core);
+        targets.insert("impl".to_string(), lib("libimpl.a"));
+        targets.insert("hdr".to_string(), lib("libhdr.a"));
+
+        let m = manifest_from_project(&inputs(&names, &targets, &empty)).unwrap();
+        assert_eq!(
+            m.components.keys().cloned().collect::<Vec<_>>(),
+            vec!["demo::core", "demo::hdr", "demo::impl"]
+        );
+        let c = &m.components["demo::core"];
+        assert_eq!(c.kind, Some(ComponentKind::Archive));
+        assert_eq!(
+            c.location["Release"],
+            PathBuf::from("@prefix@/lib/libcore.a")
+        );
+        assert_eq!(c.includes, vec![PathBuf::from("@prefix@/include")]);
+        assert_eq!(c.defines, vec![("CORE_FLAG".to_string(), None)]);
+        assert_eq!(c.compile_options, vec!["-fno-exceptions"]);
+        assert_eq!(c.cxx_std, Some(17));
+        assert_eq!(c.requires, vec!["demo::hdr", "zstd::libzstd"]);
+        assert_eq!(c.link_requires, vec!["demo::impl"]);
+        assert_eq!(c.origin_find_name, "demo");
+    }
+
+    #[test]
+    fn shim_export_library_requires_version() {
+        let names = demo_names();
+        let empty = BTreeSet::new();
+        let targets = BTreeMap::from([("core".to_string(), lib("libcore.a"))]);
+        let mut x = inputs(&names, &targets, &empty);
+        x.version = None;
+        let err = manifest_from_project(&x).unwrap_err().to_string();
+        assert!(err.contains("[package].version"), "{err}");
+        assert!(err.contains("SameMajorVersion"), "{err}");
+    }
+
+    #[test]
+    fn shim_export_closure_uninstalled_member_errors() {
+        let names = demo_names();
+        let empty = BTreeSet::new();
+        let mut core = lib("libcore.a");
+        core.local_deps_private = vec!["impl".into()];
+        let mut impl_t = ExportTarget::new(TargetKind::StaticLibrary, "libimpl.a");
+        impl_t.install = false;
+        let targets = BTreeMap::from([
+            ("core".to_string(), core),
+            ("impl".to_string(), impl_t),
+        ]);
+        let err = manifest_from_project(&inputs(&names, &targets, &empty))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("add install = true to 'impl'"), "{err}");
+    }
+
+    #[test]
+    fn shim_export_closure_dev_member_errors() {
+        let names = demo_names();
+        let empty = BTreeSet::new();
+        let mut core = lib("libcore.a");
+        core.local_deps_public = vec!["testing".into()];
+        let mut testing = ExportTarget::new(TargetKind::StaticLibrary, "libtesting.a");
+        testing.dev = true;
+        let targets = BTreeMap::from([
+            ("core".to_string(), core),
+            ("testing".to_string(), testing),
+        ]);
+        let err = manifest_from_project(&inputs(&names, &targets, &empty))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dev target 'testing'"), "{err}");
+    }
+
+    #[test]
+    fn shim_export_dev_dependency_in_closure_errors() {
+        let names = demo_names();
+        let dev_deps = BTreeSet::from(["googletest".to_string()]);
+        let mut core = lib("libcore.a");
+        core.external_public = vec!["GTest::gtest".into()];
+        core.external_dep_keys = BTreeSet::from(["googletest".to_string()]);
+        let targets = BTreeMap::from([("core".to_string(), core)]);
+        let err = manifest_from_project(&inputs(&names, &targets, &dev_deps))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dev-dependency 'googletest'"), "{err}");
+    }
+
+    #[test]
+    fn shim_export_install_on_dev_target_errors() {
+        let names = demo_names();
+        let empty = BTreeSet::new();
+        let mut t = lib("libx.a");
+        t.dev = true;
+        let targets = BTreeMap::from([("x".to_string(), t)]);
+        let err = manifest_from_project(&inputs(&names, &targets, &empty))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("install = true on a dev/test target"), "{err}");
+    }
+
+    #[test]
+    fn shim_export_absolute_flag_rejected() {
+        let names = demo_names();
+        let empty = BTreeSet::new();
+        let mut t = lib("libx.a");
+        t.public_flags = vec!["-L/opt/homebrew/lib".into()];
+        let targets = BTreeMap::from([("x".to_string(), t)]);
+        let err = manifest_from_project(&inputs(&names, &targets, &empty))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("absolute"), "{err}");
+
+        assert!(flag_smells_absolute("/opt/x"));
+        assert!(flag_smells_absolute("-I/opt/x"));
+        assert!(flag_smells_absolute("-Wl,-rpath,/opt/x"));
+        assert!(flag_smells_absolute("-DX=/opt/x"));
+        assert!(!flag_smells_absolute("-fno-exceptions"));
+        assert!(!flag_smells_absolute("-Wl,-dead_strip"));
+    }
+
+    // ---- header derivation (§6.4) ---------------------------------------
+
+    #[test]
+    fn shim_derive_headers_walks_public_include_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let api = root.join("include/api");
+        fs::create_dir_all(api.join("sub")).unwrap();
+        fs::write(api.join("a.hpp"), "a").unwrap();
+        fs::write(api.join("sub/b.h"), "b").unwrap();
+        fs::write(api.join("notes.txt"), "not a header").unwrap();
+        fs::write(api.join("t.inc"), "inc").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(api.join("a.hpp"), api.join("link.hpp")).unwrap();
+
+        let mut t = lib("libcore.a");
+        t.public_includes = vec![api.clone()];
+        let mut warnings = Vec::new();
+        let derived = derive_headers("core", &t, root, &mut warnings).unwrap();
+        let dests: Vec<String> = derived
+            .iter()
+            .map(|(_, d)| d.to_string_lossy().into_owned())
+            .collect();
+        // Sorted by destination; .txt and the symlink are skipped.
+        assert_eq!(dests, vec!["a.hpp", "sub/b.h", "t.inc"]);
+    }
+
+    #[test]
+    fn shim_derive_headers_override_with_negation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("absl/base")).unwrap();
+        fs::create_dir_all(root.join("absl/testing")).unwrap();
+        fs::write(root.join("absl/base/config.h"), "c").unwrap();
+        fs::write(root.join("absl/testing/mock.h"), "m").unwrap();
+
+        let mut t = lib("libabsl.a");
+        t.public_headers = Some(PublicHeadersSpec {
+            base: ".".into(),
+            patterns: vec![
+                "absl/**/*.h".into(),
+                "!absl/testing/**".into(),
+                "!absl/gone/**".into(), // matches nothing -> warning, not error
+            ],
+        });
+        let mut warnings = Vec::new();
+        let derived = derive_headers("absl", &t, root, &mut warnings).unwrap();
+        let dests: Vec<String> = derived
+            .iter()
+            .map(|(_, d)| d.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(dests, vec!["absl/base/config.h"]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("absl/gone"), "{warnings:?}");
+    }
+
+    #[test]
+    fn shim_derive_headers_empty_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let api = root.join("include/api");
+        fs::create_dir_all(&api).unwrap();
+        fs::write(api.join("readme.txt"), "no headers").unwrap();
+
+        let mut t = lib("libcore.a");
+        t.public_includes = vec![api];
+        let mut warnings = Vec::new();
+        let err = derive_headers("core", &t, root, &mut warnings)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("header derivation is"), "{err}");
+        assert!(err.contains("include/api"), "{err}");
+    }
+
+    // ---- install planning + execution (§6.2/§6.5) -----------------------
+
+    /// Full fixture: project root with headers + data, build dir with fake
+    /// outputs, one external (locked, patched) dep reference.
+    fn staged_fixture(root: &Path) -> (BTreeMap<String, ExportTarget>, PathBuf) {
+        let api = root.join("include/api");
+        fs::create_dir_all(&api).unwrap();
+        fs::write(api.join("core.hpp"), "// core api\n").unwrap();
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::write(root.join("data/x.cfg"), "cfg-bytes\n").unwrap();
+
+        let build_dir = root.join("build");
+        fs::create_dir_all(&build_dir).unwrap();
+        fs::write(build_dir.join("libcore.a"), "!<arch>\ncore").unwrap();
+        fs::write(build_dir.join("tool"), "#!binary\n").unwrap();
+
+        let mut targets = BTreeMap::new();
+        let mut core = lib("libcore.a");
+        core.public_includes = vec![api];
+        core.public_defines = vec![("CORE_FLAG".into(), None)];
+        core.external_public = vec!["zstd::libzstd".into()];
+        core.external_dep_keys = BTreeSet::from(["zstd".to_string()]);
+        targets.insert("core".to_string(), core);
+        let mut tool = exe("tool");
+        tool.runtime_data = vec![RuntimeDataSpec {
+            from: "data".into(),
+            patterns: Vec::new(),
+            to: String::new(),
+        }];
+        targets.insert("tool".to_string(), tool);
+        (targets, build_dir)
+    }
+
+    const PATCH_ID: &str =
+        "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn shim_install_plan_layout_and_manifest_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (targets, build_dir) = staged_fixture(root);
+        let names = demo_names();
+        let empty = BTreeSet::new();
+        let x = inputs(&names, &targets, &empty);
+        let project = demo_project();
+        let lockfile = demo_lockfile(root);
+        let patch_bytes = BTreeMap::from([(
+            "zstd".to_string(),
+            vec![(PATCH_ID.to_string(), b"--- a/f\n+++ b/f\n".to_vec())],
+        )]);
+        let sysdeps = BTreeMap::new();
+        let prefix = root.join("prefix");
+
+        let plan = plan_install(&InstallRequest {
+            project: &project,
+            export: &x,
+            project_root: root,
+            build_dir: &build_dir,
+            prefix: &prefix,
+            lockfile: &lockfile,
+            patch_bytes: &patch_bytes,
+            sysdeps: &sysdeps,
+            targets: &[],
+        })
+        .unwrap();
+
+        let dests: Vec<String> = plan
+            .actions
+            .iter()
+            .map(|a| a.dest.to_string_lossy().into_owned())
+            .collect();
+        let expected: Vec<String> = vec![
+            "bin/tool".to_string(),
+            "include/core.hpp".to_string(),
+            "lib/cmake/demo/cppkg-manifest.json".to_string(),
+            "lib/cmake/demo/demoConfig.cmake".to_string(),
+            "lib/cmake/demo/demoConfigVersion.cmake".to_string(),
+            format!(
+                "lib/cmake/demo/patches/{}.patch",
+                PATCH_ID.strip_prefix("blake3:").unwrap()
+            ),
+            "lib/libcore.a".to_string(),
+            "share/demo/data/x.cfg".to_string(),
+        ];
+        assert_eq!(dests, expected);
+
+        let content = |name: &str| -> String {
+            plan.actions
+                .iter()
+                .find(|a| a.dest.to_string_lossy().contains(name))
+                .map(|a| match &a.src {
+                    StageSource::Rendered(s) => s.clone(),
+                    other => panic!("{name} should be rendered, got {other:?}"),
+                })
+                .unwrap()
+        };
+        let json = content("cppkg-manifest.json");
+        assert!(json.contains("\"@prefix@/lib/libcore.a\""), "{json}");
+        assert!(json.contains("\"requires\""), "{json}");
+        assert!(json.contains("\"zstd\""), "{json}");
+        assert!(
+            json.contains("\"commit\": \"0123456789abcdef0123456789abcdef01234567\""),
+            "{json}"
+        );
+        assert!(json.contains(&format!("\"{PATCH_ID}\"")), "{json}");
+
+        let cfg = content("demoConfig.cmake");
+        assert!(cfg.contains("find_dependency(zstd)"), "{cfg}");
+        assert!(
+            cfg.contains("\"${_IMPORT_PREFIX}/lib/libcore.a\""),
+            "{cfg}"
+        );
+        assert!(
+            cfg.contains("get_filename_component(_IMPORT_PREFIX \"${CMAKE_CURRENT_LIST_FILE}\" PATH)"),
+            "{cfg}"
+        );
+        // Relocatable: the chosen prefix never appears in rendered content.
+        assert!(!cfg.contains(prefix.to_string_lossy().as_ref()), "{cfg}");
+
+        // --list rendering covers every action.
+        let listing = plan.describe();
+        assert_eq!(listing.lines().count(), plan.actions.len());
+        assert!(listing.contains("bin/tool"), "{listing}");
+    }
+
+    #[test]
+    fn shim_install_execute_destdir_composition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (targets, build_dir) = staged_fixture(root);
+        let names = demo_names();
+        let empty = BTreeSet::new();
+        let x = inputs(&names, &targets, &empty);
+        let project = demo_project();
+        let lockfile = demo_lockfile(root);
+        let patch_bytes = BTreeMap::new();
+        let sysdeps = BTreeMap::new();
+
+        // A prefix that is never written to directly: DESTDIR staging must
+        // compose <destdir><prefix> while content refers to <prefix>.
+        let prefix = PathBuf::from("/opt/demo");
+        let plan = plan_install(&InstallRequest {
+            project: &project,
+            export: &x,
+            project_root: root,
+            build_dir: &build_dir,
+            prefix: &prefix,
+            lockfile: &lockfile,
+            patch_bytes: &patch_bytes,
+            sysdeps: &sysdeps,
+            targets: &[],
+        })
+        .unwrap();
+
+        let destdir = root.join("destdir");
+        execute_install(&plan, Some(&destdir)).unwrap();
+        let staged_root = destdir.join("opt/demo");
+        assert!(staged_root.join("bin/tool").exists());
+        assert!(staged_root.join("lib/libcore.a").exists());
+        assert!(staged_root.join("include/core.hpp").exists());
+        assert!(staged_root.join("share/demo/data/x.cfg").exists());
+        let cfg =
+            fs::read_to_string(staged_root.join("lib/cmake/demo/demoConfig.cmake")).unwrap();
+        assert!(!cfg.contains("destdir"), "{cfg}");
+        assert!(!cfg.contains("/opt/demo"), "{cfg}");
+
+        // Idempotent: running again succeeds and changes nothing fatal.
+        execute_install(&plan, Some(&destdir)).unwrap();
+    }
+
+    #[test]
+    fn shim_install_named_subset_closes_over_local_deps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let api = root.join("inc");
+        fs::create_dir_all(&api).unwrap();
+        fs::write(api.join("a.h"), "a").unwrap();
+        let build_dir = root.join("build");
+        fs::create_dir_all(&build_dir).unwrap();
+        fs::write(build_dir.join("libcore.a"), "core").unwrap();
+        fs::write(build_dir.join("libimpl.a"), "impl").unwrap();
+        fs::write(build_dir.join("tool"), "tool").unwrap();
+
+        let mut core = lib("libcore.a");
+        core.public_includes = vec![api.clone()];
+        core.local_deps_private = vec!["impl".into()];
+        let mut impl_t = lib("libimpl.a");
+        impl_t.public_includes = vec![api];
+        let targets = BTreeMap::from([
+            ("core".to_string(), core),
+            ("impl".to_string(), impl_t),
+            ("tool".to_string(), exe("tool")),
+        ]);
+        let names = demo_names();
+        let empty = BTreeSet::new();
+        let x = inputs(&names, &targets, &empty);
+        let project = demo_project();
+        let lockfile = demo_lockfile(root);
+        let (pb, sd) = (BTreeMap::new(), BTreeMap::new());
+        let prefix = root.join("prefix");
+
+        let plan = plan_install(&InstallRequest {
+            project: &project,
+            export: &x,
+            project_root: root,
+            build_dir: &build_dir,
+            prefix: &prefix,
+            lockfile: &lockfile,
+            patch_bytes: &pb,
+            sysdeps: &sd,
+            targets: &["core".to_string()],
+        })
+        .unwrap();
+        let dests: Vec<String> = plan
+            .actions
+            .iter()
+            .map(|a| a.dest.to_string_lossy().into_owned())
+            .collect();
+        // impl pulled in by closure; tool (unnamed) stays out.
+        assert!(dests.contains(&"lib/libimpl.a".to_string()), "{dests:?}");
+        assert!(!dests.contains(&"bin/tool".to_string()), "{dests:?}");
+        // Both libs share include/a.h with identical bytes: deduped, no error.
+        assert_eq!(
+            dests.iter().filter(|d| d.as_str() == "include/a.h").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn shim_install_collision_different_bytes_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let inc_a = root.join("a");
+        let inc_b = root.join("b");
+        fs::create_dir_all(&inc_a).unwrap();
+        fs::create_dir_all(&inc_b).unwrap();
+        fs::write(inc_a.join("x.h"), "version A").unwrap();
+        fs::write(inc_b.join("x.h"), "version B").unwrap();
+        let build_dir = root.join("build");
+        fs::create_dir_all(&build_dir).unwrap();
+        fs::write(build_dir.join("liba.a"), "a").unwrap();
+        fs::write(build_dir.join("libb.a"), "b").unwrap();
+
+        let mut a = lib("liba.a");
+        a.public_includes = vec![inc_a];
+        let mut b = lib("libb.a");
+        b.public_includes = vec![inc_b];
+        let targets =
+            BTreeMap::from([("a".to_string(), a), ("b".to_string(), b)]);
+        let names = demo_names();
+        let empty = BTreeSet::new();
+        let x = inputs(&names, &targets, &empty);
+        let project = demo_project();
+        let lockfile = demo_lockfile(root);
+        let (pb, sd) = (BTreeMap::new(), BTreeMap::new());
+        let prefix = root.join("prefix");
+
+        let err = plan_install(&InstallRequest {
+            project: &project,
+            export: &x,
+            project_root: root,
+            build_dir: &build_dir,
+            prefix: &prefix,
+            lockfile: &lockfile,
+            patch_bytes: &pb,
+            sysdeps: &sd,
+            targets: &[],
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("install collision"), "{err}");
+        assert!(err.contains("x.h"), "{err}");
+    }
+
+    #[test]
+    fn shim_install_bad_patch_id_spelling_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (targets, build_dir) = staged_fixture(root);
+        let names = demo_names();
+        let empty = BTreeSet::new();
+        let x = inputs(&names, &targets, &empty);
+        let project = demo_project();
+        let lockfile = demo_lockfile(root);
+        let patch_bytes = BTreeMap::from([(
+            "zstd".to_string(),
+            vec![("sha256:beef".to_string(), b"x".to_vec())],
+        )]);
+        let sysdeps = BTreeMap::new();
+        let prefix = root.join("prefix");
+
+        let err = plan_install(&InstallRequest {
+            project: &project,
+            export: &x,
+            project_root: root,
+            build_dir: &build_dir,
+            prefix: &prefix,
+            lockfile: &lockfile,
+            patch_bytes: &patch_bytes,
+            sysdeps: &sysdeps,
+            targets: &[],
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("blake3:<hex>"), "{err}");
+    }
+
+    #[test]
+    fn shim_export_threads_builtin_gets_find_dependency_only() {
+        let mut c = Component::default();
+        c.kind = Some(ComponentKind::Archive);
+        c.location.insert(
+            "Release".to_string(),
+            PathBuf::from("@prefix@/lib/libbench.a"),
+        );
+        c.includes = vec![PathBuf::from("@prefix@/include")];
+        c.link_requires = vec!["Threads::Threads".to_string()];
+        c.origin_find_name = "demo".to_string();
+        let manifest = Manifest {
+            package: "demo".to_string(),
+            components: BTreeMap::from([("demo::bench".to_string(), c)]),
+            notes: Vec::new(),
+        };
+        assert!(manifest_mentions(&manifest, "Threads::Threads"));
+
+        let names = demo_names();
+        let (requires, sysreq) = (BTreeMap::new(), BTreeMap::new());
+        let files = render_export_files(&ExportRenderInputs {
+            package_name: "demo",
+            names: &names,
+            manifest: &manifest,
+            version: Some("1.0.0"),
+            find_dependencies: &["Threads".to_string()],
+            requires: &requires,
+            system_requires: &sysreq,
+        })
+        .unwrap();
+        let cfg = &files
+            .iter()
+            .find(|(p, _)| p.ends_with("demoConfig.cmake"))
+            .unwrap()
+            .1;
+        assert!(cfg.contains("find_dependency(Threads)"), "{cfg}");
+        assert!(
+            cfg.contains("$<LINK_ONLY:Threads::Threads>"),
+            "{cfg}"
+        );
+        let json = &files
+            .iter()
+            .find(|(p, _)| p.ends_with("cppkg-manifest.json"))
+            .unwrap()
+            .1;
+        assert!(!json.contains("\"requires\""), "{json}");
+    }
+
+    // ---- ConfigVersion (SameMajorVersion) -------------------------------
+
+    /// Evaluate the rendered ConfigVersion file the way find_package does,
+    /// via cmake script mode with PACKAGE_FIND_VERSION pre-set.
+    fn eval_config_version(
+        dir: &Path,
+        version_file: &Path,
+        find_version: &str,
+        find_major: &str,
+    ) -> (String, String) {
+        let driver = dir.join(format!("driver-{find_version}-{find_major}.cmake"));
+        fs::write(
+            &driver,
+            format!(
+                "set(PACKAGE_FIND_VERSION \"{find_version}\")\n\
+                 set(PACKAGE_FIND_VERSION_MAJOR \"{find_major}\")\n\
+                 include(\"{}\")\n\
+                 message(STATUS \"compat=${{PACKAGE_VERSION_COMPATIBLE}} exact=${{PACKAGE_VERSION_EXACT}}\")\n",
+                version_file.display()
+            ),
+        )
+        .unwrap();
+        let out = Command::new("cmake")
+            .arg("-P")
+            .arg(&driver)
+            .output()
+            .expect("failed to spawn cmake; is it on PATH?");
+        assert!(out.status.success(), "{out:?}");
+        let text = String::from_utf8_lossy(&out.stdout).to_string()
+            + &String::from_utf8_lossy(&out.stderr);
+        let line = text
+            .lines()
+            .find(|l| l.contains("compat="))
+            .unwrap_or_else(|| panic!("no compat line in: {text}"))
+            .to_string();
+        let compat = line
+            .split("compat=")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string();
+        let exact = line
+            .split("exact=")
+            .nth(1)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        (compat, exact)
+    }
+
+    #[test]
+    fn shim_config_version_same_major_semantics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vf = tmp.path().join("demoConfigVersion.cmake");
+        fs::write(&vf, config_version_same_major("1.9.5")).unwrap();
+
+        // Older request within the major: compatible, not exact.
+        let (compat, exact) = eval_config_version(tmp.path(), &vf, "1.2", "1");
+        assert_eq!((compat.as_str(), exact.as_str()), ("TRUE", ""));
+        // Same version: compatible and exact.
+        let (compat, exact) = eval_config_version(tmp.path(), &vf, "1.9.5", "1");
+        assert_eq!((compat.as_str(), exact.as_str()), ("TRUE", "TRUE"));
+        // Next major: incompatible (SameMajorVersion).
+        let (compat, _) = eval_config_version(tmp.path(), &vf, "2.0", "2");
+        assert_eq!(compat, "FALSE");
+        // Newer request within the major: incompatible (request > ours).
+        let (compat, _) = eval_config_version(tmp.path(), &vf, "1.10", "1");
+        assert_eq!(compat, "FALSE");
+        // No version requested: passes.
+        let (compat, _) = eval_config_version(tmp.path(), &vf, "", "");
+        assert_eq!(compat, "TRUE");
+    }
+
+    // ---- the §6.3 fixpoint: probe(installed Config) == emitted manifest --
+
+    fn test_toolchain() -> crate::toolchain::Toolchain {
+        use crate::toolchain::{Dialect, Toolchain, ToolchainIdentity};
+        Toolchain {
+            cxx: PathBuf::from("/usr/bin/c++"),
+            cc: PathBuf::from("/usr/bin/cc"),
+            ar: PathBuf::from("/usr/bin/ar"),
+            sdk_path: None,
+            identity: ToolchainIdentity {
+                dialect: Dialect::Gnu,
+                compiler_id: "AppleClang".to_string(),
+                version: "0".to_string(),
+                target_triple: "arm64-apple-darwin".to_string(),
+                stdlib: "libc++".to_string(),
+                stdlib_version: "0".to_string(),
+                sdk_version: None,
+            },
+        }
+    }
+
+    /// §6.3 acceptance: probing the installed Config with the tier-2 probe
+    /// reproduces `cppkg-manifest.json` exactly, modulo the prefix.
+    #[test]
+    fn shim_export_fixpoint_probe_reproduces_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let api = root.join("include/api");
+        fs::create_dir_all(&api).unwrap();
+        fs::write(api.join("core.hpp"), "// api\n").unwrap();
+        let impl_api = root.join("include/impl-api");
+        fs::create_dir_all(&impl_api).unwrap();
+        fs::write(impl_api.join("impl.hpp"), "// impl\n").unwrap();
+        let build_dir = root.join("build");
+        fs::create_dir_all(&build_dir).unwrap();
+        fs::write(build_dir.join("libcore.a"), "!<arch>core").unwrap();
+        fs::write(build_dir.join("libimpl.a"), "!<arch>impl").unwrap();
+
+        let mut core = lib("libcore.a");
+        core.public_includes = vec![api];
+        core.public_defines = vec![
+            ("CORE_FLAG".into(), None),
+            ("CORE_STR".into(), Some("\"hi\"".into())),
+        ];
+        core.public_flags = vec!["-fno-exceptions".into()];
+        core.public_link_flags = vec!["-Wl,-dead_strip".into()];
+        core.cxx_std = Some(17);
+        core.local_deps_private = vec!["impl".into()];
+        let mut impl_t = lib("libimpl.a");
+        impl_t.public_includes = vec![impl_api];
+        let targets = BTreeMap::from([
+            ("core".to_string(), core),
+            ("impl".to_string(), impl_t),
+        ]);
+        let names = demo_names();
+        let empty = BTreeSet::new();
+        let x = inputs(&names, &targets, &empty);
+        let project = demo_project();
+        let lockfile = demo_lockfile(root);
+        let (pb, sd) = (BTreeMap::new(), BTreeMap::new());
+        let prefix = root.join("prefix");
+
+        let plan = plan_install(&InstallRequest {
+            project: &project,
+            export: &x,
+            project_root: root,
+            build_dir: &build_dir,
+            prefix: &prefix,
+            lockfile: &lockfile,
+            patch_bytes: &pb,
+            sysdeps: &sd,
+            targets: &[],
+        })
+        .unwrap();
+        execute_install(&plan, None).unwrap();
+        // Canonical prefix: macOS temp paths mix /var and /private/var, and
+        // CMake reports the spelling it was handed.
+        let prefix = fs::canonicalize(&prefix).unwrap();
+
+        let records = crate::probe::probe_installed(
+            "demo",
+            std::slice::from_ref(&prefix),
+            BuildConfig::Release,
+            &test_toolchain(),
+            &root.join("probe-work"),
+        )
+        .unwrap();
+        let probed =
+            crate::manifest::from_probe("demo", "demo", BuildConfig::Release, &records)
+                .unwrap();
+
+        // Expected: the emitted manifest with @prefix@ substituted, run
+        // through the same ingestion transforms every probed/loaded manifest
+        // gets (A.1 classifies imported include dirs as system at ingestion,
+        // so the probed side carries them in `system_includes`).
+        let mut expected = manifest_from_project(&x).unwrap();
+        let prefix_str = prefix.to_string_lossy().into_owned();
+        for c in expected.components.values_mut() {
+            for path in c.location.values_mut() {
+                *path = PathBuf::from(
+                    path.to_string_lossy()
+                        .replace(EXPORT_PREFIX_PLACEHOLDER, &prefix_str),
+                );
+            }
+            c.includes = c
+                .includes
+                .iter()
+                .map(|p| {
+                    PathBuf::from(
+                        p.to_string_lossy()
+                            .replace(EXPORT_PREFIX_PLACEHOLDER, &prefix_str),
+                    )
+                })
+                .collect();
+        }
+        crate::manifest::apply_ingestion_transforms(&mut expected);
+
+        assert_eq!(
+            probed.components, expected.components,
+            "probe of the installed Config must reproduce the export manifest"
         );
     }
 }

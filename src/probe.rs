@@ -47,6 +47,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context};
 
+use crate::manifest::Manifest;
 use crate::schema::BuildConfig;
 use crate::toolchain::Toolchain;
 use crate::Result;
@@ -132,6 +133,38 @@ pub fn probe_installed(
         .output()
         .context("failed to run `cmake` (is it on PATH?)")?;
     if !output.status.success() {
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Spec A.4: the raw CMake config-not-found blob almost always means
+        // the package installs its config under a different name than the
+        // dependency key — translate it into the find-package hint instead
+        // of making the user excavate the log.
+        if log_mentions_config_not_found(&combined, find_name) {
+            let installed = discover_config_names(prefix_path);
+            let installed_line = if installed.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "CMake package configs actually installed in the probed prefixes: {}.\n",
+                    installed.join(", ")
+                )
+            };
+            bail!(
+                "probe: find_package({find_name}) could not locate a package configuration \
+                 file ({find_name}Config.cmake / {lower}-config.cmake) in the package's \
+                 install prefix.\n\
+                 {installed_line}\
+                 If the package installs its CMake config under a different name than the \
+                 dependency key, set `find-package = \"<Name>\"` on this dependency in \
+                 CppPkg.toml.\n\
+                 CMake logs: {logs}",
+                lower = find_name.to_lowercase(),
+                logs = build_dir.join("CMakeFiles").display(),
+            );
+        }
         bail!(
             "probe configure for find_package({find_name}) failed ({status})\n\
              work dir: {work}\n\
@@ -305,7 +338,7 @@ string(ASCII 30 RS)
 string(ASCII 31 US)
 
 get_property(_cppkg_pre DIRECTORY PROPERTY IMPORTED_TARGETS)
-find_package(@FIND_NAME@ REQUIRED CONFIG)
+find_package(@FIND_ARGS@)
 get_property(_cppkg_post DIRECTORY PROPERTY IMPORTED_TARGETS)
 
 set(_cppkg_new "")
@@ -347,9 +380,15 @@ foreach(_cppkg_t IN LISTS _cppkg_new)
   file(GENERATE OUTPUT "probe-out/${_cppkg_i}.rec" CONTENT "${_cppkg_c}" TARGET "${_cppkg_t}")
   math(EXPR _cppkg_i "${_cppkg_i} + 1")
 endforeach()
-"#;
+@EPILOGUE@"#;
 
 fn render_probe_cmakelists(find_name: &str, config: BuildConfig) -> String {
+    // Installed store packages are probed CONFIG-only: the store install is
+    // the only legitimate provider, and a module fallback would be a leak.
+    render_probe_cmakelists_with(&format!("{find_name} REQUIRED CONFIG"), config, "")
+}
+
+fn render_probe_cmakelists_with(find_args: &str, config: BuildConfig, epilogue: &str) -> String {
     let props = probed_properties(config)
         .iter()
         .map(|p| format!("  {p}"))
@@ -357,8 +396,9 @@ fn render_probe_cmakelists(find_name: &str, config: BuildConfig) -> String {
         .join("\n");
     PROBE_TEMPLATE
         .replace("@CONFIG@", cmake_config_name(config))
-        .replace("@FIND_NAME@", find_name)
+        .replace("@FIND_ARGS@", find_args)
         .replace("@PROPS@", &props)
+        .replace("@EPILOGUE@", epilogue)
 }
 
 /// find_name is interpolated into CMake source; restrict it to characters
@@ -372,6 +412,313 @@ fn validate_find_name(find_name: &str) -> Result<()> {
         bail!("invalid find_package name for probe: {find_name:?} (allowed: [A-Za-z0-9_.-]+)");
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// System-dependency probing (wave-1 spec §5.3, resolution mode "cmake")
+// ---------------------------------------------------------------------------
+
+/// Machine facts recorded alongside a system dependency's interface
+/// manifest: they feed `hashing::sysdep_hash` (domain `cppkg-sysdep-v1`) and
+/// the sysdep store entry's re-validation (`facts.json` — serde derives are
+/// for that file). Header trees and system frameworks are not
+/// content-hashed — the spec's documented gap.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SysdepFacts {
+    /// `<find_name>_VERSION` as reported by find_package; empty when the
+    /// package reports none.
+    pub resolved_version: String,
+    /// Sorted absolute paths of the resolved library artifacts.
+    pub library_paths: Vec<String>,
+    /// `blake3:<hex>` of each library file's bytes, parallel to
+    /// `library_paths`.
+    pub library_hashes: Vec<String>,
+    /// Sorted include directories the interface declares.
+    pub include_dirs: Vec<String>,
+}
+
+/// Probe a `system = true` dependency from the machine (§5.3, v1 resolution
+/// mode "cmake"): run `find_package(<find_name> [min_version] REQUIRED)` —
+/// module or config mode, the machine's copy is the legitimate provider —
+/// and extract the imported targets exactly like `probe_installed`.
+///
+/// The hermetic find restrictions are opened for exactly this package: this
+/// probe project contains a single find_package with no store prefix path,
+/// and no find-package leak check runs (consuming the machine IS the point);
+/// registries and environment-derived prefixes stay off, and honesty is
+/// restored by the recorded facts + sysdep hash. An uninstalled package gets
+/// the §5.3 both-worlds error; a too-old one, the min-version translation.
+pub fn probe_system(
+    dep_key: &str,
+    find_name: &str,
+    min_version: Option<&str>,
+    toolchain: &Toolchain,
+    work_dir: &Path,
+) -> Result<(Manifest, SysdepFacts)> {
+    validate_find_name(find_name)?;
+    if let Some(v) = min_version {
+        validate_min_version(dep_key, v)?;
+    }
+    fs::create_dir_all(work_dir)
+        .with_context(|| format!("creating sysdep probe work dir {}", work_dir.display()))?;
+    let build_dir = work_dir.join("build");
+    let _ = fs::remove_dir_all(&build_dir);
+    fs::create_dir_all(&build_dir)
+        .with_context(|| format!("creating sysdep probe build dir {}", build_dir.display()))?;
+
+    // System packages carry one artifact regardless of build config; probe
+    // under Release so config genexes flatten deterministically, and
+    // replicate the resolved locations across configs below.
+    let config = BuildConfig::Release;
+    let find_args = match min_version {
+        Some(v) => format!("{find_name} {v} REQUIRED"),
+        None => format!("{find_name} REQUIRED"),
+    };
+    // The resolved version is a configure-time variable, not a target
+    // property, so it travels via its own file instead of a probe record.
+    let epilogue = format!(
+        "\nfile(WRITE \"${{CMAKE_BINARY_DIR}}/sysdep-version.txt\" \"${{{find_name}_VERSION}}\")\n"
+    );
+    let toolchain_file = write_probe_toolchain(work_dir, toolchain)?;
+    fs::write(
+        work_dir.join("CMakeLists.txt"),
+        render_probe_cmakelists_with(&find_args, config, &epilogue),
+    )
+    .with_context(|| format!("writing sysdep probe CMakeLists.txt in {}", work_dir.display()))?;
+
+    let mut cmd = Command::new("cmake");
+    cmd.arg("-G")
+        .arg("Ninja")
+        .arg("-S")
+        .arg(work_dir)
+        .arg("-B")
+        .arg(&build_dir)
+        .arg(format!(
+            "-DCMAKE_TOOLCHAIN_FILE={}",
+            toolchain_file.to_string_lossy()
+        ))
+        .arg(format!("-DCMAKE_BUILD_TYPE={}", cmake_config_name(config)))
+        .arg("-DCMAKE_POLICY_VERSION_MINIMUM=3.5");
+    // Registries and env-derived prefixes stay off (they are per-host caches,
+    // not "the machine's package"); system prefixes remain reachable — that
+    // is the opening §5.3 grants this one package.
+    cmd.args(crate::cmake_build::find_control_args());
+    apply_scrubbed_env(&mut cmd);
+
+    let output = cmd
+        .output()
+        .context("failed to run `cmake` (is it on PATH?)")?;
+    if !output.status.success() {
+        return Err(translate_sysdep_failure(
+            dep_key,
+            find_name,
+            min_version,
+            &output,
+            &build_dir,
+        ));
+    }
+
+    let raw = read_probe_outputs(&build_dir.join("probe-out"))?;
+    let mut records = parse_records(&raw)?;
+    for rec in &mut records {
+        if rec.property == RAW_LINK_LIBRARIES_PROP {
+            rec.value = decode_raw_transport(&rec.value);
+        }
+    }
+    let mut manifest = crate::manifest::from_probe(dep_key, find_name, config, &records)?;
+
+    // One artifact per component, whatever the consumer's config: replicate
+    // the Release-resolved location so Debug builds link the same file the
+    // sysdep hash describes.
+    for c in manifest.components.values_mut() {
+        if let Some(loc) = c.location.get(config.cmake_name()).cloned() {
+            for name in ["Debug", "Release", "RelWithDebInfo", "MinSizeRel"] {
+                c.location
+                    .entry(name.to_string())
+                    .or_insert_with(|| loc.clone());
+            }
+        }
+    }
+
+    let resolved_version = fs::read_to_string(build_dir.join("sysdep-version.txt"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    let mut library_paths: std::collections::BTreeSet<String> = Default::default();
+    let mut include_dirs: std::collections::BTreeSet<String> = Default::default();
+    for c in manifest.components.values() {
+        for p in c.location.values().chain(c.link_paths.iter()) {
+            library_paths.insert(p.to_string_lossy().into_owned());
+        }
+        for p in c.includes.iter().chain(c.system_includes.iter()) {
+            include_dirs.insert(p.to_string_lossy().into_owned());
+        }
+    }
+    let library_paths: Vec<String> = library_paths.into_iter().collect();
+    let mut library_hashes = Vec::with_capacity(library_paths.len());
+    for p in &library_paths {
+        let bytes = fs::read(p).with_context(|| {
+            format!(
+                "system dependency '{dep_key}': reading resolved library {p} \
+                 (find_package({find_name}) reported it, but it is not readable)"
+            )
+        })?;
+        library_hashes.push(crate::hashing::blake3_bytes_labeled(&bytes));
+    }
+
+    let facts = SysdepFacts {
+        resolved_version,
+        library_paths,
+        library_hashes,
+        include_dirs: include_dirs.into_iter().collect(),
+    };
+    Ok((manifest, facts))
+}
+
+/// `min-version` reaches CMake source text; keep it to version-shaped
+/// characters so it cannot alter parsing.
+fn validate_min_version(dep_key: &str, v: &str) -> Result<()> {
+    let ok = !v.is_empty()
+        && v.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && !v.starts_with('.')
+        && !v.ends_with('.');
+    if !ok {
+        bail!(
+            "system dependency '{dep_key}': min-version {v:?} is not a plain \
+             dotted version (digits and dots only)"
+        );
+    }
+    Ok(())
+}
+
+/// Translate a failed sysdep probe configure (§5.3): version rejection gets
+/// the min-version translation, not-found gets the both-worlds error, and
+/// anything else keeps the raw tail.
+fn translate_sysdep_failure(
+    dep_key: &str,
+    find_name: &str,
+    min_version: Option<&str>,
+    output: &std::process::Output,
+    build_dir: &Path,
+) -> anyhow::Error {
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let norm = squash_whitespace(&combined);
+    let logs = build_dir.join("CMakeFiles");
+
+    // Version rejection, config mode ("...that is compatible with requested
+    // version...") or module mode ("Found unsuitable version ... but
+    // required is at least ...").
+    if norm.contains("compatible with requested version")
+        || norm.contains("but required is at least")
+    {
+        let requested = min_version.unwrap_or("?");
+        let found = extract_quoted(&norm, "Found unsuitable version \"")
+            .map(|v| format!("The machine has version {v}. "))
+            .unwrap_or_default();
+        return anyhow::anyhow!(
+            "system dependency '{dep_key}': the installed {find_name} does not satisfy \
+             min-version = \"{requested}\". {found}\
+             Install a newer {dep_key}, or relax `min-version` on \
+             [dependencies.{dep_key}] in CppPkg.toml.\n\
+             CMake logs: {}",
+            logs.display()
+        );
+    }
+
+    // Not found at all: the §5.3 both-worlds error.
+    if norm.contains(&format!("package configuration file provided by \"{find_name}\""))
+        || norm.contains(&format!("Could NOT find {find_name}"))
+        || norm.contains(&format!("By not providing \"Find{find_name}.cmake\""))
+    {
+        return anyhow::anyhow!(
+            "system dependency '{dep_key}': find_package({find_name}) found nothing on \
+             this machine.\n\
+             Declare it as a fetched dependency (git/url) to build hermetically, or \
+             install {dep_key} (e.g. `pacman -S {dep_key}` / `brew install {dep_key}`).\n\
+             CMake logs: {}",
+            logs.display()
+        );
+    }
+
+    anyhow::anyhow!(
+        "sysdep probe configure for find_package({find_name}) failed ({status})\n\
+         CMake logs: {logs}\n\
+         --- output (tail) ---\n{tail}",
+        status = output.status,
+        logs = logs.display(),
+        tail = squash_tail(&combined, 4000),
+    )
+}
+
+/// Collapse all whitespace runs to single spaces: CMake wraps its error
+/// prose at ~70 columns with indented continuations, which would defeat
+/// plain substring checks.
+fn squash_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn squash_tail(s: &str, max: usize) -> String {
+    tail_str(s.as_bytes(), max)
+}
+
+/// First `"..."`-quoted token after `marker` in `s`, if any.
+fn extract_quoted<'a>(s: &'a str, marker: &str) -> Option<&'a str> {
+    let start = s.find(marker)? + marker.len();
+    let rest = &s[start..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+/// A.4 helper: does the configure log contain CMake's config-mode not-found
+/// message for exactly this package?
+fn log_mentions_config_not_found(log: &str, find_name: &str) -> bool {
+    squash_whitespace(log)
+        .contains(&format!("package configuration file provided by \"{find_name}\""))
+}
+
+/// Walk the probed prefixes (shallow) for `<Name>Config.cmake` /
+/// `<name>-config.cmake` files and return the names they answer to — the
+/// candidates for a `find-package = "..."` fix.
+fn discover_config_names(prefixes: &[PathBuf]) -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for prefix in prefixes {
+        walk_config_names(prefix, 0, &mut names);
+    }
+    names.into_iter().take(10).collect()
+}
+
+fn walk_config_names(dir: &Path, depth: usize, out: &mut std::collections::BTreeSet<String>) {
+    // Install layouts put configs at most under lib/cmake/<Name>/ — depth 4
+    // covers every conventional layout without scanning the world.
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_config_names(&path, depth + 1, out);
+            continue;
+        }
+        let Some(fname) = path.file_name().and_then(|f| f.to_str()) else {
+            continue;
+        };
+        if let Some(stem) = fname.strip_suffix("Config.cmake") {
+            if !stem.is_empty() {
+                out.insert(stem.to_string());
+            }
+        } else if let Some(stem) = fname.strip_suffix("-config.cmake")
+            && !stem.is_empty()
+        {
+            out.insert(stem.to_string());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -611,6 +958,96 @@ mod tests {
         assert!(validate_find_name("bad name").is_err());
         assert!(validate_find_name("bad\"name").is_err());
         assert!(validate_find_name("${evil}").is_err());
+    }
+
+    #[test]
+    fn probe_render_sysdep_cmakelists() {
+        let text = render_probe_cmakelists_with(
+            "zstd 1.5 REQUIRED",
+            BuildConfig::Release,
+            "\nfile(WRITE \"${CMAKE_BINARY_DIR}/sysdep-version.txt\" \"${zstd_VERSION}\")\n",
+        );
+        assert!(text.contains("find_package(zstd 1.5 REQUIRED)"));
+        assert!(text.contains("sysdep-version.txt"));
+        // The ordinary render leaves no epilogue behind.
+        let plain = render_probe_cmakelists("fmt", BuildConfig::Release);
+        assert!(!plain.contains("@EPILOGUE@"));
+        assert!(!plain.contains("sysdep-version.txt"));
+    }
+
+    #[test]
+    fn probe_validate_min_version() {
+        assert!(validate_min_version("zstd", "1.5").is_ok());
+        assert!(validate_min_version("zstd", "1").is_ok());
+        assert!(validate_min_version("zstd", "1.5.7").is_ok());
+        assert!(validate_min_version("zstd", "").is_err());
+        assert!(validate_min_version("zstd", ".5").is_err());
+        assert!(validate_min_version("zstd", "1.").is_err());
+        assert!(validate_min_version("zstd", "1.5;rm -rf /").is_err());
+    }
+
+    #[test]
+    fn probe_not_found_log_detection_survives_wrapping() {
+        // CMake wraps its prose; detection must not depend on line breaks.
+        let log = "CMake Error at CMakeLists.txt:9 (find_package):\n  Could not find a package\n  configuration file provided by\n  \"googletest\" with any of the following names:";
+        assert!(log_mentions_config_not_found(log, "googletest"));
+        assert!(!log_mentions_config_not_found(log, "GTest"));
+    }
+
+    #[test]
+    fn probe_discover_config_names_walks_conventional_layouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |rel: &str| {
+            let p = tmp.path().join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, "# config").unwrap();
+        };
+        mk("lib/cmake/GTest/GTestConfig.cmake");
+        mk("lib/cmake/GTest/GTestConfigVersion.cmake");
+        mk("share/zstd/zstd-config.cmake");
+        // GTestConfigVersion.cmake ends in Version.cmake, not Config.cmake —
+        // it never becomes a candidate name.
+        assert_eq!(
+            discover_config_names(&[tmp.path().to_path_buf()]),
+            vec!["GTest".to_string(), "zstd".to_string()]
+        );
+    }
+
+    #[test]
+    fn probe_translate_sysdep_failure_messages() {
+        use std::os::unix::process::ExitStatusExt;
+        let fail = |stderr: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        // Not-found (both config and module phrasings) => both-worlds error.
+        let out = fail(
+            "CMake Error: Could not find a package configuration file provided by\n  \"zstd\"",
+        );
+        let msg = translate_sysdep_failure("zstd", "zstd", None, &out, Path::new("/b")).to_string();
+        assert!(msg.contains("found nothing on this machine"), "{msg}");
+        assert!(msg.contains("fetched dependency (git/url)"), "{msg}");
+        assert!(msg.contains("brew install zstd"), "{msg}");
+
+        let out = fail("CMake Error: Could NOT find ZLIB (missing: ZLIB_LIBRARY)");
+        let msg = translate_sysdep_failure("zlib", "ZLIB", None, &out, Path::new("/b")).to_string();
+        assert!(msg.contains("found nothing"), "{msg}");
+
+        // Version rejection => min-version translation with the found version.
+        let out = fail(
+            "Could NOT find ZLIB: Found unsuitable version \"1.2.11\", but required is at\n  least \"9.9\"",
+        );
+        let msg =
+            translate_sysdep_failure("zlib", "ZLIB", Some("9.9"), &out, Path::new("/b")).to_string();
+        assert!(msg.contains("does not satisfy min-version = \"9.9\""), "{msg}");
+        assert!(msg.contains("version 1.2.11"), "{msg}");
+        assert!(msg.contains("relax `min-version`"), "{msg}");
+
+        // Anything else keeps the raw tail.
+        let out = fail("CMake Error: some other explosion");
+        let msg = translate_sysdep_failure("zstd", "zstd", None, &out, Path::new("/b")).to_string();
+        assert!(msg.contains("some other explosion"), "{msg}");
     }
 
     // Real-CMake end-to-end coverage (fixture install + probe) lives in

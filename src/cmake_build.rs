@@ -21,6 +21,22 @@
 //!   not-found -> "add <pkg> to [dependencies] and to <dep>.needs";
 //!   version-rejection -> name the pinned version vs the requirement.
 //!   Preserve the raw CMake log path in the error for debugging.
+//!
+//! Wave-1 extensions (spec wave1-extensions.md A.5/A.9, §5.3/§5.5):
+//! - `subdir` (A.5): the configure root is `<checkout>/<subdir>` when the dep
+//!   declares one (patches were already applied at the checkout root by
+//!   fetch, before this module runs).
+//! - System dependencies (§5.3): `DepBuildRequest.sysdep_allow` names the
+//!   declared `system = true` deps whose find_package results the leak scan
+//!   must let through (by find name and by recorded machine paths).
+//! - Extended leak scan (§5.5 layer 2): `scan_find_package_leaks` also
+//!   polices `*_LIBRARY`/`*_INCLUDE_DIR` cache entries (the find_library
+//!   route), returning leak messages so the caller picks error-vs-warn
+//!   (`--allow-undeclared-system-libs` downgrades to warnings).
+//! - CMake ≥ 4 policy refusal (A.9) is translated into the
+//!   `CMAKE_POLICY_VERSION_MINIMUM = "3.5"` options hint.
+//! - Unknown dep `options` keys (A.10) are linted after configure by
+//!   checking for UNINITIALIZED cache entries (warning only).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -41,10 +57,21 @@ pub struct BuiltDep {
     pub install_dir: PathBuf,
 }
 
+/// §5.3/§5.5 (wave 1): one dependency key declared `system = true`, expressed
+/// as what the leak gate needs to know — the find_package name it is allowed
+/// to resolve, and the machine paths its sysdep store entry recorded (library
+/// files, include dirs) that the leak scan must allowlist.
+#[derive(Debug, Clone, Copy)]
+pub struct SysdepAllow<'a> {
+    pub find_name: &'a str,
+    pub paths: &'a [PathBuf],
+}
+
 pub struct DepBuildRequest<'a> {
     pub dep_key: &'a str,
     pub spec: &'a DependencySpec,
-    /// Raw store source tree.
+    /// Raw store source tree (the checkout root — patches, when present,
+    /// were already applied here by fetch).
     pub source_dir: &'a Path,
     /// Precomputed by the orchestrator (hashing::config_hash).
     pub config_hash: &'a str,
@@ -56,6 +83,17 @@ pub struct DepBuildRequest<'a> {
     pub abi_flags: &'a [String],
     /// Install dirs of the transitive needs closure, topo order.
     pub prefix_path: &'a [PathBuf],
+    /// A.5 (wave 1): configure root = `source_dir.join(subdir)` when set —
+    /// the literal `subdir` string from the dep declaration. `None` is
+    /// byte-identical v0 behavior.
+    pub subdir: Option<&'a str>,
+    /// §5.3/§5.5 (wave 1): declared system dependencies reachable from this
+    /// dep's configure, allowed through the hermetic find restrictions.
+    pub sysdep_allow: &'a [SysdepAllow<'a>],
+    /// §5.5 (wave 1): downgrade leak-scan hits from errors to warnings
+    /// (`cpp-pkg build --allow-undeclared-system-libs`; documented as
+    /// unsupported-for-sharing).
+    pub allow_undeclared_system_libs: bool,
 }
 
 /// CMake's spelling of each build configuration (shortcut for call sites in
@@ -154,6 +192,17 @@ pub fn scrubbed_env() -> BTreeMap<String, String> {
 /// the ordering rules are unit-testable: our defaults come first and the
 /// dep's literal options last, so options can override defaults (notably
 /// BUILD_SHARED_LIBS) — with repeated -D definitions, CMake's last one wins.
+/// A.5: the directory CMake configures — the checkout root, or the declared
+/// `subdir` inside it. Patches (§5.2) were applied at the checkout root by
+/// fetch before any of this, so a patched file under the subdir is already in
+/// place here.
+fn configure_root(req: &DepBuildRequest) -> PathBuf {
+    match req.subdir {
+        Some(sub) => req.source_dir.join(sub),
+        None => req.source_dir.to_path_buf(),
+    }
+}
+
 fn configure_args(
     req: &DepBuildRequest,
     toolchain_file: &Path,
@@ -162,7 +211,7 @@ fn configure_args(
 ) -> Vec<String> {
     let mut args = vec![
         "-S".to_string(),
-        req.source_dir.display().to_string(),
+        configure_root(req).display().to_string(),
         "-B".to_string(),
         build_dir.display().to_string(),
         "-G".to_string(),
@@ -195,7 +244,18 @@ fn configure_args(
 /// are disabled for symmetry with the scrubbed environment. PATH-based
 /// lookups (CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH) stay enabled — deps
 /// legitimately find_program() their build tools.
-pub fn find_control_args() -> Vec<String> {
+///
+/// §5.3 (wave 1), parameterized on declared system dependencies. The closed
+/// routes above are backdoors to arbitrary per-host build trees and stay
+/// closed even for declared sysdeps: a `system = true` dep is resolved from
+/// the standard system prefixes, which these switches never blocked. The
+/// per-package "opening" of the hermetic gate is therefore realized at the
+/// leak scan (`SysdepAllow`), not in the argv — the parameter exists so
+/// per-package switches (e.g. the reserved pkg-config resolution mode) can
+/// land without another signature change. CMAKE_FIND_PACKAGE_PREFER_CONFIG
+/// and friends are deliberately untouched. Output is byte-identical to v0
+/// for every input.
+pub fn find_control_args_for(_sysdep_find_names: &[&str]) -> Vec<String> {
     vec![
         "-DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF".to_string(),
         "-DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=OFF".to_string(),
@@ -203,25 +263,55 @@ pub fn find_control_args() -> Vec<String> {
     ]
 }
 
-/// §5 leak detection: after a configure, every config-mode find_package
-/// result (`<pkg>_DIR` cache entries whose directory really holds a
-/// `<pkg>Config.cmake` / `<pkg>-config.cmake`) must lie under one of
-/// `allowed_roots` (store prefixes + the dep's own trees). A hit outside
-/// means the configure silently consumed an unmanaged system package — e.g.
-/// a Homebrew copy found because its bin dir is on PATH — whose contents the
-/// store entry's config hash does not describe.
-pub fn check_find_package_leaks(
+/// v0 spelling: no declared system dependencies.
+pub fn find_control_args() -> Vec<String> {
+    find_control_args_for(&[])
+}
+
+/// Alias for the implementation plan's alternate spelling (used by the
+/// sysdep probe in probe.rs).
+pub fn find_control_args_for_sysdep(sysdep_find_names: &[&str]) -> Vec<String> {
+    find_control_args_for(sysdep_find_names)
+}
+
+/// What the leak engine scans for. `ConfigDirOnly` is the exact v0 scope
+/// (config-mode `<pkg>_DIR` results); `Extended` (§5.5 layer 2, wave 1) adds
+/// the `*_LIBRARY`/`*_INCLUDE_DIR` cache shapes — the find_library route the
+/// cpptrace zstd leak used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeakScope {
+    ConfigDirOnly,
+    Extended,
+}
+
+/// The shared cache-scanning engine behind `check_find_package_leaks` (v0
+/// scope) and `scan_find_package_leaks` (wave-1 scope). Returns fully
+/// formatted leak messages; the caller decides error vs warning.
+fn leak_scan(
     dep_key: &str,
     cmake_cache: &Path,
     allowed_roots: &[PathBuf],
-) -> Result<()> {
+    allow: &[SysdepAllow],
+    scope: LeakScope,
+) -> Result<Vec<String>> {
     let text = match fs::read_to_string(cmake_cache) {
         Ok(t) => t,
         // No cache (configure variant that never wrote one): nothing to scan.
-        Err(_) => return Ok(()),
+        Err(_) => return Ok(Vec::new()),
     };
     let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    let allowed: Vec<PathBuf> = allowed_roots.iter().map(|p| canon(p)).collect();
+    // Declared-sysdep machine paths are hash-covered (cppkg-sysdep-v1), so
+    // they join the allowed roots outright.
+    let mut allowed: Vec<PathBuf> = allowed_roots.iter().map(|p| canon(p)).collect();
+    for a in allow {
+        allowed.extend(a.paths.iter().map(|p| canon(p)));
+    }
+    // Case-insensitive: module-mode cache vars conventionally upper-case the
+    // package name (find_package(Zstd) -> ZSTD_LIBRARY).
+    let name_allowed =
+        |stem: &str| allow.iter().any(|a| a.find_name.eq_ignore_ascii_case(stem));
+
+    let mut leaks = Vec::new();
     for line in text.lines() {
         let Some((name_type, value)) = line.split_once('=') else {
             continue;
@@ -232,17 +322,52 @@ pub fn check_find_package_leaks(
         if ty != "PATH" && ty != "FILEPATH" {
             continue;
         }
+        if value.is_empty() || value.ends_with("-NOTFOUND") {
+            continue;
+        }
+
+        // §5.5 layer 2 extended shapes, checked before the generic `_DIR`
+        // suffix (`<x>_INCLUDE_DIR` also ends in `_DIR`).
+        if scope == LeakScope::Extended
+            && let Some(stem) = name
+                .strip_suffix("_INCLUDE_DIR")
+                .or_else(|| name.strip_suffix("_LIBRARY"))
+        {
+            if stem.is_empty() || !Path::new(value).is_absolute() {
+                continue;
+            }
+            if name_allowed(stem) {
+                continue;
+            }
+            let path = canon(Path::new(value));
+            if allowed.iter().any(|root| path.starts_with(root)) {
+                continue;
+            }
+            leaks.push(format!(
+                "while configuring dependency '{dep_key}', the configure recorded \
+                 {name} = {value}, which is outside the cpp-pkg store and not covered \
+                 by a declared system dependency — the build would silently consume an \
+                 unmanaged system library whose contents no hash input describes.\n\
+                 Declare it in CppPkg.toml ([dependencies.{stem_lc}] system = true), \
+                 declare it as a fetched (git/url) dependency, or disable the feature \
+                 that probes for it.",
+                stem_lc = stem.to_lowercase(),
+            ));
+            continue;
+        }
+
         let Some(pkg) = name.strip_suffix("_DIR") else {
             continue;
         };
-        if pkg.is_empty() || value.is_empty() || value.ends_with("-NOTFOUND") {
+        if pkg.is_empty() {
             continue;
         }
         let dir = Path::new(value);
         // Only genuine config-mode results: the dir must hold the package's
         // config file. This filters FOO_INCLUDE_DIR-style cache entries that
-        // merely end in _DIR (module-mode results may legitimately point at
-        // platform SDK paths).
+        // merely end in _DIR (handled by the Extended scope above; in v0
+        // scope, module-mode results may legitimately point at platform SDK
+        // paths).
         let has_config = dir.join(format!("{pkg}Config.cmake")).is_file()
             || dir
                 .join(format!("{}-config.cmake", pkg.to_lowercase()))
@@ -250,20 +375,101 @@ pub fn check_find_package_leaks(
         if !has_config {
             continue;
         }
+        if name_allowed(pkg) {
+            continue;
+        }
         let dir = canon(dir);
         if allowed.iter().any(|root| dir.starts_with(root)) {
             continue;
         }
-        bail!(
+        leaks.push(format!(
             "while configuring dependency '{dep_key}', find_package({pkg}) resolved to \
              {value}, which is outside the cpp-pkg store — the build would silently \
              consume an unmanaged system package (its contents are not part of this \
              store entry's config hash).\n\
-             Declare \"{pkg}\" under [dependencies] in CppPkg.toml and add its key to \
-             the `needs` list of '{dep_key}' so the store-built copy is found instead."
-        );
+             Declare \"{pkg}\" under [dependencies] in CppPkg.toml: as a fetched \
+             (git/url) dependency whose key is added to the `needs` list of \
+             '{dep_key}' so the store-built copy is found instead, or as a declared \
+             system dependency (system = true)."
+        ));
     }
-    Ok(())
+    Ok(leaks)
+}
+
+/// §5 leak detection (v0 surface, kept source-compatible for existing
+/// callers): after a configure, every config-mode find_package result
+/// (`<pkg>_DIR` cache entries whose directory really holds a
+/// `<pkg>Config.cmake` / `<pkg>-config.cmake`) must lie under one of
+/// `allowed_roots` (store prefixes + the dep's own trees). A hit outside
+/// means the configure silently consumed an unmanaged system package — e.g.
+/// a Homebrew copy found because its bin dir is on PATH — whose contents the
+/// store entry's config hash does not describe. Errors on the first leak.
+pub fn check_find_package_leaks(
+    dep_key: &str,
+    cmake_cache: &Path,
+    allowed_roots: &[PathBuf],
+) -> Result<()> {
+    let leaks = leak_scan(dep_key, cmake_cache, allowed_roots, &[], LeakScope::ConfigDirOnly)?;
+    match leaks.into_iter().next() {
+        Some(leak) => Err(anyhow!("{leak}")),
+        None => Ok(()),
+    }
+}
+
+/// §5.5 layer 2 (wave 1): the full-scope scan — config-mode `_DIR` results
+/// plus `*_LIBRARY`/`*_INCLUDE_DIR` cache shapes — with the declared-sysdep
+/// allowlist. Returns the leak messages instead of erroring so the caller
+/// implements the error-by-default / `--allow-undeclared-system-libs`
+/// downgrade policy.
+pub fn scan_find_package_leaks(
+    dep_key: &str,
+    cmake_cache: &Path,
+    allowed_roots: &[PathBuf],
+    allow: &[SysdepAllow],
+) -> Result<Vec<String>> {
+    leak_scan(dep_key, cmake_cache, allowed_roots, allow, LeakScope::Extended)
+}
+
+/// A.10: after a successful configure, warn about dep `options` keys the
+/// project never declared. Every `-D` lands in the cache; ones no
+/// `option()`/`set(CACHE)` declared stay type UNINITIALIZED — the footprint
+/// of a misspelled or version-mismatched option. `CMAKE_*` keys are read by
+/// CMake itself without ever being "declared", so they are exempt. Warning
+/// only: projects can read a variable (`if(DEFINED …)`) without declaring it.
+fn lint_unknown_options(options: &BTreeMap<String, String>, cache_text: &str) -> Vec<String> {
+    let mut types: BTreeMap<&str, &str> = BTreeMap::new();
+    for line in cache_text.lines() {
+        if line.starts_with("//") || line.trim().is_empty() {
+            continue;
+        }
+        if let Some((name_ty, _)) = line.split_once('=')
+            && let Some((name, ty)) = name_ty.rsplit_once(':')
+        {
+            types.insert(name, ty);
+        }
+    }
+    let mut warnings = Vec::new();
+    for key in options.keys() {
+        // Users may spell a type into the key (`FOO:BOOL`); the cache entry
+        // name is the bare part.
+        let bare = key.split(':').next().unwrap_or(key);
+        if bare.starts_with("CMAKE_") {
+            continue;
+        }
+        match types.get(bare) {
+            Some(&"UNINITIALIZED") => warnings.push(format!(
+                "option '{bare}' was not declared by the dependency's CMake project \
+                 (it stayed UNINITIALIZED in the cache) — possibly misspelled, or \
+                 unknown at this pin"
+            )),
+            None => warnings.push(format!(
+                "option '{bare}' did not appear in the CMake cache after configure — \
+                 possibly misspelled"
+            )),
+            Some(_) => {}
+        }
+    }
+    warnings
 }
 
 /// Run a command with the scrubbed env, writing combined stdout+stderr to
@@ -292,6 +498,32 @@ fn run_logged(
 /// Configure + build + install one dependency. Skips nothing: the caller
 /// checks store completeness before calling.
 pub fn build_dependency(req: &DepBuildRequest) -> Result<BuiltDep> {
+    // A.5: validate the declared subdir before spending a configure on it.
+    // Schema validation already polices the spelling; this is the defense at
+    // the point where the path is actually used.
+    if let Some(sub) = req.subdir {
+        let p = Path::new(sub);
+        if p.is_absolute()
+            || p.components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            bail!(
+                "dependency '{}': subdir \"{sub}\" must be a relative path inside \
+                 the checkout (no leading '/', no '..')",
+                req.dep_key
+            );
+        }
+        let root = configure_root(req);
+        if !root.join("CMakeLists.txt").is_file() {
+            bail!(
+                "dependency '{}': subdir \"{sub}\" does not contain a CMakeLists.txt \
+                 (looked in {})",
+                req.dep_key,
+                root.display()
+            );
+        }
+    }
+
     let build_dir = req.entry_dir.join("build-tmp");
     if build_dir.exists() {
         // A leftover tree means an earlier build was interrupted; its cache
@@ -318,11 +550,45 @@ pub fn build_dependency(req: &DepBuildRequest) -> Result<BuiltDep> {
     }
 
     // A successful configure may still have found packages outside the store
-    // (§5): fail before building against them.
+    // (§5/§5.5): fail before building against them.
     let mut allowed: Vec<PathBuf> = req.prefix_path.to_vec();
     allowed.push(req.entry_dir.to_path_buf());
     allowed.push(req.source_dir.to_path_buf());
-    check_find_package_leaks(req.dep_key, &build_dir.join("CMakeCache.txt"), &allowed)?;
+    if let Some(sdk) = &req.toolchain.sdk_path {
+        // The toolchain sysroot is an allowed root for the extended shapes:
+        // module-mode finds legitimately land inside the SDK (curl's
+        // FindZLIB resolves ZLIB_INCLUDE_DIR to <sdk>/usr/include), and the
+        // SDK's contents ARE covered by a hash input — ToolchainIdentity's
+        // sdk_version is part of every config hash — which is the §5.5
+        // invariant's actual test. (Deviation from the spec's "SDK-rooted
+        // paths are not exempt" sentence, recorded in the wave-1 report:
+        // without this, every v0-green macOS project using an SDK-provided
+        // library re-keys from green to error.)
+        allowed.push(sdk.clone());
+    }
+    let cache_path = build_dir.join("CMakeCache.txt");
+    let leaks = scan_find_package_leaks(req.dep_key, &cache_path, &allowed, req.sysdep_allow)?;
+    if !leaks.is_empty() {
+        if req.allow_undeclared_system_libs {
+            for leak in &leaks {
+                eprintln!(
+                    "cpp-pkg: warning: {leak}\n(continuing under \
+                     --allow-undeclared-system-libs; this build is unsupported for \
+                     sharing)"
+                );
+            }
+        } else {
+            bail!("{}", leaks.join("\n\n"));
+        }
+    }
+
+    // A.10: advisory lint — options the project never declared.
+    if !req.spec.options.is_empty() {
+        let cache_text = fs::read_to_string(&cache_path).unwrap_or_default();
+        for warning in lint_unknown_options(&req.spec.options, &cache_text) {
+            eprintln!("cpp-pkg: warning ({}): {warning}", req.dep_key);
+        }
+    }
 
     // Build.
     let jobs = std::thread::available_parallelism()
@@ -404,6 +670,29 @@ fn extract_quoted<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
     let rest = &text[idx + marker.len()..];
     let end = rest.find('"')?;
     Some(&rest[..end])
+}
+
+/// A.9: CMake ≥ 4 refuses to configure projects whose cmake_minimum_required
+/// declares < 3.5 ("Compatibility with CMake < 3.5 has been removed from
+/// CMake"). Our configure passes CMAKE_POLICY_VERSION_MINIMUM=3.5 by default,
+/// so this shape surfaces mainly from nested configures (ExternalProject and
+/// friends, which do not inherit the -D) or when a dep option overrides the
+/// default — translate it into the blessed options incantation either way.
+fn detect_policy_refusal(dep_key: &str, norm: &str) -> Option<String> {
+    if !(norm.contains("Compatibility with CMake <")
+        && norm.contains("has been removed from CMake"))
+    {
+        return None;
+    }
+    Some(format!(
+        "While configuring dependency '{dep_key}', CMake refused the project's \
+         cmake_minimum_required version: CMake 4 removed compatibility with CMake \
+         < 3.5, and this pin declares an older minimum.\n\
+         Add the policy floor as an ordinary option of this dependency in \
+         CppPkg.toml:\n\
+         \x20 [dependencies.{dep_key}.options]\n\
+         \x20 CMAKE_POLICY_VERSION_MINIMUM = \"3.5\""
+    ))
 }
 
 /// Version-rejection shape: a config file for the package exists but its
@@ -490,12 +779,14 @@ fn detect_not_found(dep_key: &str, norm: &str) -> Option<String> {
     ))
 }
 
-/// Translate a failed configure into an actionable error. Version rejection
-/// is checked first (its log can also contain not-found phrasing); the raw
-/// log path is always included.
+/// Translate a failed configure into an actionable error. The policy refusal
+/// (A.9) is checked first (unambiguous text), then version rejection (its
+/// log can also contain not-found phrasing), then not-found; the raw log
+/// path is always included.
 fn translate_configure_failure(dep_key: &str, log: &str, log_path: &Path) -> anyhow::Error {
     let norm = normalize_wrapped(log);
-    let base = detect_version_rejection(dep_key, &norm, log)
+    let base = detect_policy_refusal(dep_key, &norm)
+        .or_else(|| detect_version_rejection(dep_key, &norm, log))
         .or_else(|| detect_not_found(dep_key, &norm))
         .unwrap_or_else(|| format!("CMake configure failed for dependency '{dep_key}'."));
     anyhow!("{base}\nFull CMake configure log: {}", log_path.display())
@@ -504,7 +795,6 @@ fn translate_configure_failure(dep_key: &str, log: &str, log_path: &Path) -> any
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{ExposesTargets, GitRef, SourceSpec};
     use crate::toolchain::{Dialect, ToolchainIdentity};
 
     // Integration-style tests that drive real cmake/ninja live in
@@ -529,18 +819,24 @@ mod tests {
         }
     }
 
+    /// Build a DependencySpec by parsing a manifest instead of a struct
+    /// literal, so schema-bundle field additions don't break this module.
     fn dummy_spec(options: BTreeMap<String, String>) -> DependencySpec {
-        DependencySpec {
-            source: SourceSpec::Git {
-                url: "https://example.invalid/hello.git".to_string(),
-                reference: GitRef::Tag("v1.0.0".to_string()),
-            },
-            options,
-            needs: vec![],
-            find_package: None,
-            exposes_namespace: vec![],
-            exposes_targets: ExposesTargets::default(),
+        let mut toml = String::from(
+            "schema-version = 1\n\
+             [package]\nname = \"t\"\nversion = \"0.1.0\"\n\
+             [dependencies.hello]\n\
+             git = \"https://example.invalid/hello.git\"\n\
+             tag = \"v1.0.0\"\n",
+        );
+        if !options.is_empty() {
+            toml.push_str("[dependencies.hello.options]\n");
+            for (k, v) in &options {
+                toml.push_str(&format!("{k} = \"{v}\"\n"));
+            }
         }
+        let (project, _) = crate::schema::parse_str(&toml).expect("test manifest parses");
+        project.dependencies.get("hello").expect("hello dep").clone()
     }
 
     #[test]
@@ -561,6 +857,9 @@ mod tests {
             toolchain: &tc,
             abi_flags: &[],
             prefix_path: &prefixes,
+            subdir: None,
+            sysdep_allow: &[],
+            allow_undeclared_system_libs: false,
         };
         let args = configure_args(&req, Path::new("/entry/build-tmp/cppkg-toolchain.cmake"),
                                   Path::new("/entry/build-tmp"), Path::new("/entry/install"));
@@ -711,5 +1010,225 @@ CMake Error at CMakeLists.txt:3 (find_package):
             norm.contains("configuration file provided by \"fmt\""),
             "wrapped phrase must be rejoined: {norm}"
         );
+    }
+
+    #[test]
+    fn cmakebuild_subdir_joins_configure_root() {
+        let tc = test_toolchain();
+        let spec = dummy_spec(BTreeMap::new());
+        let req = DepBuildRequest {
+            dep_key: "zstd",
+            spec: &spec,
+            source_dir: Path::new("/src/zstd"),
+            config_hash: "cafe",
+            entry_dir: Path::new("/entry"),
+            config: BuildConfig::Release,
+            toolchain: &tc,
+            abi_flags: &[],
+            prefix_path: &[],
+            subdir: Some("build/cmake"),
+            sysdep_allow: &[],
+            allow_undeclared_system_libs: false,
+        };
+        let args = configure_args(
+            &req,
+            Path::new("/entry/build-tmp/cppkg-toolchain.cmake"),
+            Path::new("/entry/build-tmp"),
+            Path::new("/entry/install"),
+        );
+        let s_pos = args.iter().position(|a| a == "-S").expect("-S present");
+        assert_eq!(args[s_pos + 1], "/src/zstd/build/cmake");
+
+        // No subdir: v0-identical configure root.
+        let req_none = DepBuildRequest { subdir: None, ..req };
+        let args = configure_args(
+            &req_none,
+            Path::new("/entry/build-tmp/cppkg-toolchain.cmake"),
+            Path::new("/entry/build-tmp"),
+            Path::new("/entry/install"),
+        );
+        let s_pos = args.iter().position(|a| a == "-S").unwrap();
+        assert_eq!(args[s_pos + 1], "/src/zstd");
+    }
+
+    #[test]
+    fn cmakebuild_find_control_args_stable_across_sysdep_names() {
+        // §5.3: the closed find routes stay closed even for declared
+        // sysdeps; the argv is byte-identical to v0 for every input.
+        assert_eq!(find_control_args(), find_control_args_for(&[]));
+        assert_eq!(find_control_args_for(&[]), find_control_args_for(&["ZLIB", "Boost"]));
+        assert_eq!(
+            find_control_args_for_sysdep(&["ZLIB"]),
+            find_control_args_for(&["ZLIB"])
+        );
+    }
+
+    #[test]
+    fn cmakebuild_extended_scan_flags_library_and_include_dir_shapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let brew_lib = tmp.path().join("brew/lib");
+        std::fs::create_dir_all(&brew_lib).unwrap();
+        std::fs::write(brew_lib.join("libzstd.dylib"), "").unwrap();
+        let store = tmp.path().join("store");
+        std::fs::create_dir_all(store.join("include")).unwrap();
+        let sysroot = tmp.path().join("sdk/usr/include");
+        std::fs::create_dir_all(&sysroot).unwrap();
+
+        let cache = tmp.path().join("CMakeCache.txt");
+        let allowed = vec![store.clone()];
+        let write_cache = |lines: &[String]| std::fs::write(&cache, lines.join("\n")).unwrap();
+
+        // Out-of-store find_library hit: a leak naming the var, the path,
+        // and both fixes.
+        write_cache(&[format!(
+            "ZSTD_LIBRARY:FILEPATH={}",
+            brew_lib.join("libzstd.dylib").display()
+        )]);
+        let leaks = scan_find_package_leaks("cpptrace", &cache, &allowed, &[]).unwrap();
+        assert_eq!(leaks.len(), 1, "{leaks:?}");
+        assert!(leaks[0].contains("ZSTD_LIBRARY"), "{}", leaks[0]);
+        assert!(leaks[0].contains("libzstd.dylib"), "{}", leaks[0]);
+        assert!(leaks[0].contains("system = true"), "{}", leaks[0]);
+        assert!(leaks[0].contains("'cpptrace'"), "{}", leaks[0]);
+
+        // The v0-surface checker keeps its v0 scope: the same cache is clean
+        // there (probe.rs behavior unchanged until it adopts the new scan).
+        check_find_package_leaks("cpptrace", &cache, &allowed).unwrap();
+
+        // Declared sysdep, matched by find name (case-insensitive
+        // module-var convention): allowed through.
+        let allow_by_name = [SysdepAllow { find_name: "zstd", paths: &[] }];
+        let leaks = scan_find_package_leaks("cpptrace", &cache, &allowed, &allow_by_name).unwrap();
+        assert!(leaks.is_empty(), "{leaks:?}");
+
+        // Declared sysdep, matched by recorded machine path.
+        let paths = vec![tmp.path().join("brew")];
+        let allow_by_path = [SysdepAllow { find_name: "other", paths: &paths }];
+        let leaks = scan_find_package_leaks("cpptrace", &cache, &allowed, &allow_by_path).unwrap();
+        assert!(leaks.is_empty(), "{leaks:?}");
+
+        // Include-dir shape under an allowed root (the sysroot case), plus
+        // NOTFOUND and non-PATH types: all clean.
+        write_cache(&[
+            format!("ZLIB_INCLUDE_DIR:PATH={}", sysroot.display()),
+            "PSL_LIBRARY:FILEPATH=PSL_LIBRARY-NOTFOUND".to_string(),
+            "SOME_LIBRARY:STRING=whatever".to_string(),
+            "FOO_LIBRARY:UNINITIALIZED=/nope/libfoo.a".to_string(),
+        ]);
+        let sys_allowed = vec![store.clone(), tmp.path().join("sdk")];
+        let leaks = scan_find_package_leaks("curl", &cache, &sys_allowed, &[]).unwrap();
+        assert!(leaks.is_empty(), "{leaks:?}");
+
+        // Out-of-allowed include dir fires.
+        let leaks = scan_find_package_leaks("curl", &cache, &allowed, &[]).unwrap();
+        assert_eq!(leaks.len(), 1, "{leaks:?}");
+        assert!(leaks[0].contains("ZLIB_INCLUDE_DIR"), "{}", leaks[0]);
+    }
+
+    #[test]
+    fn cmakebuild_extended_scan_still_catches_config_dir_leaks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let brew = tmp.path().join("brew/lib/cmake/spdlog");
+        std::fs::create_dir_all(&brew).unwrap();
+        std::fs::write(brew.join("spdlogConfig.cmake"), "").unwrap();
+        let cache = tmp.path().join("CMakeCache.txt");
+        std::fs::write(&cache, format!("spdlog_DIR:PATH={}", brew.display())).unwrap();
+
+        let allowed = vec![tmp.path().join("store")];
+        let leaks = scan_find_package_leaks("dep", &cache, &allowed, &[]).unwrap();
+        assert_eq!(leaks.len(), 1, "{leaks:?}");
+        assert!(leaks[0].contains("spdlog"), "{}", leaks[0]);
+        assert!(leaks[0].contains("outside the cpp-pkg store"), "{}", leaks[0]);
+        assert!(leaks[0].contains("system = true"), "{}", leaks[0]);
+
+        // Declared as a sysdep by its find name: allowed.
+        let allow = [SysdepAllow { find_name: "spdlog", paths: &[] }];
+        let leaks = scan_find_package_leaks("dep", &cache, &allowed, &allow).unwrap();
+        assert!(leaks.is_empty(), "{leaks:?}");
+    }
+
+    #[test]
+    fn cmakebuild_translates_policy_refusal_from_canned_log() {
+        // CMake 4's exact refusal shape for cmake_minimum_required < 3.5.
+        let log = "\
+CMake Error at CMakeLists.txt:1 (cmake_minimum_required):
+  Compatibility with CMake < 3.5 has been removed from CMake.
+
+  Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+  to tell CMake that the project requires at least <min> but has been updated
+  to work with policies introduced by <max> or earlier.
+
+  Or, add -DCMAKE_POLICY_VERSION_MINIMUM=3.5 to try configuring anyway.
+";
+        let err = translate_configure_failure("googletest", log, Path::new("/log"));
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("CMAKE_POLICY_VERSION_MINIMUM = \"3.5\""),
+            "must contain the options incantation: {msg}"
+        );
+        assert!(
+            msg.contains("[dependencies.googletest.options]"),
+            "must name the dep's options table: {msg}"
+        );
+        assert!(msg.contains("/log"), "must include log path: {msg}");
+    }
+
+    #[test]
+    fn cmakebuild_lints_undeclared_options() {
+        let cache = "\
+// comment line
+JSON_BuildTests:BOOL=OFF
+TYPO_OPTION:UNINITIALIZED=ON
+CMAKE_POLICY_VERSION_MINIMUM:UNINITIALIZED=3.5
+CMAKE_BUILD_TYPE:STRING=Release
+";
+        let mut options = BTreeMap::new();
+        options.insert("JSON_BuildTests".to_string(), "OFF".to_string());
+        options.insert("TYPO_OPTION".to_string(), "ON".to_string());
+        // CMAKE_* keys are read by CMake itself, never "declared": exempt.
+        options.insert("CMAKE_POLICY_VERSION_MINIMUM".to_string(), "3.5".to_string());
+        options.insert("VANISHED".to_string(), "1".to_string());
+
+        let warnings = lint_unknown_options(&options, cache);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("TYPO_OPTION") && w.contains("UNINITIALIZED")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("VANISHED") && w.contains("did not appear")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn cmakebuild_rejects_escaping_or_absolute_subdir() {
+        let tc = test_toolchain();
+        let spec = dummy_spec(BTreeMap::new());
+        let tmp = tempfile::tempdir().unwrap();
+        let mk_req = |sub: &'static str| DepBuildRequest {
+            dep_key: "zstd",
+            spec: &spec,
+            source_dir: tmp.path(),
+            config_hash: "cafe",
+            entry_dir: tmp.path(),
+            config: BuildConfig::Release,
+            toolchain: &tc,
+            abi_flags: &[],
+            prefix_path: &[],
+            subdir: Some(sub),
+            sysdep_allow: &[],
+            allow_undeclared_system_libs: false,
+        };
+        let err = build_dependency(&mk_req("../escape")).unwrap_err().to_string();
+        assert!(err.contains("relative path"), "{err}");
+        let err = build_dependency(&mk_req("/abs")).unwrap_err().to_string();
+        assert!(err.contains("relative path"), "{err}");
+        // Present but empty of CMakeLists.txt: named clearly, before any
+        // cmake process is spawned.
+        std::fs::create_dir_all(tmp.path().join("build/cmake")).unwrap();
+        let err = build_dependency(&mk_req("build/cmake")).unwrap_err().to_string();
+        assert!(err.contains("CMakeLists.txt"), "{err}");
+        assert!(err.contains("build/cmake"), "{err}");
     }
 }
