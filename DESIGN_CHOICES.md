@@ -233,6 +233,22 @@ Decisions/limitations recorded from the campaign:
   per-project .clangd points at build/compile_commands.json so editors
   resolve includes.
 
+## 2026-08-14 — Migration research paradigm (user direction)
+
+v0 development is now corpus-driven: migrate real projects to cpp-pkg (not
+for upstreaming yet) and let their gap reports rank the feature backlog.
+Wave 1: **vtz first** (github.com/voladynamics/vtz — user priority), ninja,
+cppcheck, json-tui, GoogleTest, GoogleBenchmark, Abseil, cpptrace(+
+libdwarf-lite). Wave 2, after wave-1 success: Apache Arrow, then Boost.
+Deliverable per project: migrations/<name>/ overlay + GAPS.md; consolidated
+ranked backlog in migrations/BACKLOG.md. Design lens (user's words): clean,
+*elegant*, declarative; better testing story; installation + exporting;
+conditional sources; a minimal-but-sufficient escape hatch for generation
+steps; provisioning deps like zlib/zstd; cargo-familiar ergonomics that
+still serve C++ natives. Schema extensions get drafted from the data and
+user-reviewed for taste before implementation. Repo now has a remote:
+github.com/codeinred/cpp-pkg — push after committing.
+
 ## Open
 - Test dependency shortlist. Proposed: **fmt** (clean, simple installed lib),
   **spdlog** with `SPDLOG_FMT_EXTERNAL=ON` (real transitive
