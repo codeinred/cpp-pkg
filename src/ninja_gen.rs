@@ -214,9 +214,15 @@ fn render_ninja(
     let _ = writeln!(f, "  description = AR $out");
     let _ = writeln!(f);
 
+    // §1.3 link line, left to right: objects ($in) → `[flags].link-flags` +
+    // profile link-flags ($link_flags) → the target's own link-flags and the
+    // interleaved closure ($libs). $link_flags must come AFTER the objects:
+    // raw `-l`-class words are legal at package/profile scope, and a
+    // single-pass linker under GNU ld --as-needed discards a library seen
+    // before any undefined reference to it exists.
     for (rule, compiler) in [("link_cxx", &cxx), ("link_c", &cc)] {
         let _ = writeln!(f, "rule {rule}");
-        let _ = writeln!(f, "  command = {compiler} $link_flags -o $out $in $libs");
+        let _ = writeln!(f, "  command = {compiler} -o $out $in $link_flags $libs");
         let _ = writeln!(f, "  description = LINK $out");
         let _ = writeln!(f);
     }

@@ -954,8 +954,9 @@ fn classify_artifact(path: PathBuf) -> LinkInput {
     }
 }
 
-/// One raw link-stream entry plus, for Flag entries, the identity that
-/// dedup keys on: (contributor, occurrence-within-that-contributor's-block).
+/// One raw link-stream entry plus, for Flag/SystemLib/Framework entries, the
+/// identity dedup keys on: (contributor-scoped namespace,
+/// occurrence-within-that-contributor's-block).
 struct RawLink {
     input: LinkInput,
     flag_key: Option<(String, usize)>,
@@ -963,38 +964,34 @@ struct RawLink {
 
 /// Rule-5 dedup: archives keep the LAST occurrence (symbol resolution walks
 /// left to right; the last position satisfies every earlier referencer);
-/// Flag words keep the last occurrence of their (contributor, occurrence)
-/// key so they stay glued to the kept archive (§1.3 interleaving through
-/// diamonds); everything else keeps the first.
+/// Flag, SystemLib, and Framework entries carrying a (contributor,
+/// occurrence) key keep the LAST occurrence of that key so they stay glued
+/// to the kept archive (§1.3 interleaving through diamonds — a `-lrt`-class
+/// word emitted keep-first would precede the surviving archive that
+/// references it, and GNU ld --as-needed would drop the library);
+/// everything else keeps the first.
 fn dedup_link_inputs(raw: Vec<RawLink>) -> Vec<LinkInput> {
     let mut last_archive: BTreeMap<PathBuf, usize> = BTreeMap::new();
-    let mut last_flag: BTreeMap<(String, usize), usize> = BTreeMap::new();
+    let mut last_keyed: BTreeMap<(String, usize), usize> = BTreeMap::new();
     for (i, rl) in raw.iter().enumerate() {
-        match &rl.input {
-            LinkInput::Archive(p) => {
-                last_archive.insert(p.clone(), i);
-            }
-            LinkInput::Flag(_) => {
-                if let Some(k) = &rl.flag_key {
-                    last_flag.insert(k.clone(), i);
-                }
-            }
-            _ => {}
+        if let LinkInput::Archive(p) = &rl.input {
+            last_archive.insert(p.clone(), i);
+        }
+        if let Some(k) = &rl.flag_key {
+            last_keyed.insert(k.clone(), i);
         }
     }
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut out = Vec::new();
     for (i, rl) in raw.into_iter().enumerate() {
-        let keep = match &rl.input {
-            LinkInput::Archive(p) => last_archive[p] == i,
-            LinkInput::Flag(_) => match &rl.flag_key {
-                Some(k) => last_flag[k] == i,
-                None => true,
-            },
-            LinkInput::Object(p) => seen.insert(format!("obj\u{1f}{}", p.display())),
-            LinkInput::Dylib(p) => seen.insert(format!("dylib\u{1f}{}", p.display())),
-            LinkInput::SystemLib(n) => seen.insert(format!("sys\u{1f}{n}")),
-            LinkInput::Framework(n) => seen.insert(format!("fw\u{1f}{n}")),
+        let keep = match (&rl.input, &rl.flag_key) {
+            (LinkInput::Archive(p), _) => last_archive[p] == i,
+            (_, Some(k)) => last_keyed[k] == i,
+            (LinkInput::Flag(_), None) => true,
+            (LinkInput::Object(p), None) => seen.insert(format!("obj\u{1f}{}", p.display())),
+            (LinkInput::Dylib(p), None) => seen.insert(format!("dylib\u{1f}{}", p.display())),
+            (LinkInput::SystemLib(n), None) => seen.insert(format!("sys\u{1f}{n}")),
+            (LinkInput::Framework(n), None) => seen.insert(format!("fw\u{1f}{n}")),
         };
         if keep {
             out.push(rl.input);
@@ -2059,11 +2056,23 @@ impl<'a> Planner<'a> {
                 for p in &comp.link_paths {
                     push(classify_artifact(p.clone()));
                 }
-                for l in &comp.system_libs {
-                    push(LinkInput::SystemLib(l.clone()));
+                // System libs and frameworks are contributor-keyed like flag
+                // words (keep-LAST in dedup): in a diamond, this member's
+                // `-l` inputs must ride along to wherever its surviving
+                // archive lands, exactly like its link-option words below.
+                // Distinct key namespaces keep the three per-contributor
+                // occurrence counters independent.
+                for (i, l) in comp.system_libs.iter().enumerate() {
+                    out.push(RawLink {
+                        input: LinkInput::SystemLib(l.clone()),
+                        flag_key: Some((format!("syslib\u{1f}{contrib}"), i)),
+                    });
                 }
-                for f in &comp.frameworks {
-                    push(LinkInput::Framework(f.clone()));
+                for (i, fw) in comp.frameworks.iter().enumerate() {
+                    out.push(RawLink {
+                        input: LinkInput::Framework(fw.clone()),
+                        flag_key: Some((format!("framework\u{1f}{contrib}"), i)),
+                    });
                 }
                 // §1.3 interleaving: the member's own link-option words land
                 // directly behind its artifacts, never in a trailing block
@@ -2264,9 +2273,11 @@ impl<'a> Planner<'a> {
                         }
                     }
                     None => {
+                        // Inputs are file paths with the sources/includes
+                        // vocabulary: ${gen} only (§0.3).
                         let s = interp::interpolate(
                             raw,
-                            InterpPos::GenerateVarOrArgv,
+                            InterpPos::SourceOrIncludeEntry,
                             self.ictx,
                         )
                         .map_err(|e| anyhow!("generate step `{name}`: in input `{raw}`: {e}"))?;
@@ -2325,8 +2336,9 @@ impl<'a> Planner<'a> {
         Ok(steps)
     }
 
-    /// Interpolate a step's vars/argv/stdin/template (§0.3 position:
-    /// generate vars/argv). Output paths stay literal (schema-validated).
+    /// Interpolate a step's vars/argv/stdin/template (§0.3 positions:
+    /// generate vars carry package/pin identity only; argv and stdin also
+    /// take ${gen}). Output paths stay literal (schema-validated).
     fn interp_action(&self, step: &str, action: &GenerateAction) -> Result<GenerateAction> {
         let one = |v: &str| -> Result<String> {
             // ${gen} in argv resolves to the ABSOLUTE gen root: gen-exec
@@ -2342,7 +2354,11 @@ impl<'a> Planner<'a> {
                 };
                 return Ok(p.to_string_lossy().into_owned());
             }
-            interp::interpolate(v, InterpPos::GenerateVarOrArgv, self.ictx)
+            interp::interpolate(v, InterpPos::GenerateArgv, self.ictx)
+                .map_err(|e| anyhow!("generate step `{step}`: in `{v}`: {e}"))
+        };
+        let one_var = |v: &str| -> Result<String> {
+            interp::interpolate(v, InterpPos::GenerateVar, self.ictx)
                 .map_err(|e| anyhow!("generate step `{step}`: in `{v}`: {e}"))
         };
         Ok(match action {
@@ -2353,7 +2369,7 @@ impl<'a> Planner<'a> {
             } => {
                 let mut ivars = BTreeMap::new();
                 for (k, v) in vars {
-                    ivars.insert(k.clone(), one(v)?);
+                    ivars.insert(k.clone(), one_var(v)?);
                 }
                 GenerateAction::Template {
                     template: one(template)?,
@@ -2405,6 +2421,17 @@ impl<'a> Planner<'a> {
                     rd.patterns.clone()
                 };
                 let files = expand_patterns(&from_dir, &patterns, &mut self.warnings)?;
+                // §0.4: positives expanding to nothing is a hard error —
+                // build-time staging must agree with the install side, or a
+                // renamed upstream data set builds green with zero files
+                // staged (the silent zero-findings shape §6.5 exists to kill).
+                if files.is_empty() {
+                    bail!(
+                        "target `{tname}`: runtime-data patterns {patterns:?} \
+                         matched no files under {}",
+                        from_dir.display()
+                    );
+                }
                 for f in files {
                     let rel = f
                         .strip_prefix(&from_dir)
@@ -3167,7 +3194,11 @@ mod tests {
     }
 
     #[test]
-    fn system_libs_and_frameworks_dedup_keep_first() {
+    fn system_libs_and_frameworks_stay_with_their_contributor() {
+        // §1.3: dedup is by contributor, never by name — x and y each keep
+        // their own `-lz` so each lands AFTER the archive referencing it
+        // (name-keyed keep-first would hoist y's -lz before liby.a, which
+        // GNU ld --as-needed discards).
         let mut x = archive("/store/x/libx.a");
         x.system_libs = vec!["z".to_string()];
         x.frameworks = vec!["CoreFoundation".to_string()];
@@ -3190,7 +3221,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(sys, vec!["z", "m"]);
+        assert_eq!(sys, vec!["z", "z", "m"], "one -lz per contributor");
         let fw: Vec<&str> = app
             .link_inputs
             .iter()
@@ -3199,18 +3230,69 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(fw, vec!["CoreFoundation"]);
-        let z_pos = app
-            .link_inputs
-            .iter()
-            .position(|li| matches!(li, LinkInput::SystemLib(n) if n == "z"))
-            .unwrap();
+        assert_eq!(fw, vec!["CoreFoundation", "CoreFoundation"]);
         let y_pos = app
             .link_inputs
             .iter()
             .position(|li| matches!(li, LinkInput::Archive(p) if p.ends_with("liby.a")))
             .unwrap();
-        assert!(z_pos < y_pos);
+        assert!(
+            matches!(&app.link_inputs[y_pos + 1], LinkInput::SystemLib(n) if n == "z"),
+            "y's -lz follows liby.a"
+        );
+    }
+
+    #[test]
+    fn diamond_keeps_system_libs_with_kept_archive() {
+        // app -> a, b; both -> base (component with system lib rt). base's
+        // archive dedups keep-LAST; its -lrt must ride along to the kept
+        // position — keep-first would leave -lrt before libb.a/libbase.a and
+        // GNU ld --as-needed (Arch default) would discard librt before any
+        // undefined reference to shm_open is seen (the abseil corpus case).
+        let mut base_c = archive("/store/base/libbase.a");
+        base_c.system_libs = vec!["rt".to_string()];
+        let mut a_c = archive("/store/a/liba.a");
+        a_c.requires = vec!["base::base".to_string()];
+        let mut b_c = archive("/store/b/libb.a");
+        b_c.requires = vec!["base::base".to_string()];
+        let deps = BTreeMap::from([
+            ("a".to_string(), dep()),
+            ("b".to_string(), dep()),
+            ("base".to_string(), dep()),
+        ]);
+        let (p, tmp) = exe_project(deps, &["a::a", "b::b"]);
+        let manifests = BTreeMap::from([
+            ("a".to_string(), manifest("a", &[("a::a", a_c)])),
+            ("b".to_string(), manifest("b", &[("b::b", b_c)])),
+            ("base".to_string(), manifest("base", &[("base::base", base_c)])),
+        ]);
+        let plan = run_plan(&p, tmp.path(), &manifests).unwrap();
+        let app = find(&plan, "app");
+        let sys: Vec<&str> = app
+            .link_inputs
+            .iter()
+            .filter_map(|li| match li {
+                LinkInput::SystemLib(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sys, vec!["rt"], "diamond contributes once: {sys:?}");
+        let base_pos = app
+            .link_inputs
+            .iter()
+            .position(|li| matches!(li, LinkInput::Archive(p) if p.ends_with("libbase.a")))
+            .unwrap();
+        assert!(
+            matches!(&app.link_inputs[base_pos + 1], LinkInput::SystemLib(n) if n == "rt"),
+            "-lrt glued to the KEPT (last) libbase.a"
+        );
+        // Every archive precedes the surviving -lrt.
+        let rt_pos = base_pos + 1;
+        for (i, li) in app.link_inputs.iter().enumerate() {
+            if matches!(li, LinkInput::Archive(_)) {
+                assert!(i < rt_pos, "archive at {i} after -lrt at {rt_pos}");
+            }
+        }
     }
 
     #[test]
@@ -4315,6 +4397,27 @@ mod tests {
         let err = run_plan(&p, tmp.path(), &BTreeMap::new()).unwrap_err().to_string();
         assert!(err.contains("nodir"), "{err}");
         assert!(err.contains("not a directory"), "{err}");
+    }
+
+    #[test]
+    fn runtime_data_zero_matches_is_error() {
+        // §0.4: positives expanding to nothing → hard error, on the BUILD
+        // side too (the install side already errors) — an upstream rename of
+        // cppcheck's cfg files must not build green with zero files staged.
+        let tmp = TempDir::new().unwrap();
+        touch(tmp.path(), "a.cpp");
+        fs::create_dir_all(tmp.path().join("data")).unwrap();
+        fs::write(tmp.path().join("data/readme.txt"), "x").unwrap();
+        let mut a = target(TargetKind::Executable, &["a.cpp"]);
+        a.runtime_data = vec![RuntimeData {
+            from: "data".to_string(),
+            patterns: strings(&["*.cfg"]),
+            to: "data".to_string(),
+        }];
+        let p = project(BTreeMap::new(), BTreeMap::from([("a".to_string(), a)]));
+        let err = run_plan(&p, tmp.path(), &BTreeMap::new()).unwrap_err().to_string();
+        assert!(err.contains("matched no files"), "{err}");
+        assert!(err.contains("*.cfg"), "{err}");
     }
 
     // ---- run entries ---------------------------------------------------------

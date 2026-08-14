@@ -836,6 +836,10 @@ fn classify_interp_slot(path: &[Seg]) -> InterpSlot {
         &[L("targets"), K, L("cfg"), K, L("sources"), I],
         &[L("generate"), K, L("vars"), K],
         &[L("generate"), K, L("command"), I],
+        // §4.1: a `${gen}` input (or stdin) that is another step's output is
+        // THE inter-step ordering mechanism — there are no ordering fields.
+        &[L("generate"), K, L("inputs"), I],
+        &[L("generate"), K, L("stdin")],
         &[L("targets"), K, L("run"), I, L("args"), I],
         &[L("targets"), K, L("run"), I, L("cwd")],
         &[L("targets"), K, L("run"), I, L("env"), K],
@@ -899,9 +903,9 @@ fn walk_interp(value: &toml::Value, path: &mut Vec<Seg>) -> Result<()> {
                     bail!(
                         "{p}: '${{...}}' interpolation is not available in this \
                          position; legal positions: defines values, \
-                         sources/includes entries, [generate.*] vars/argv, \
-                         run-entry args/cwd/env values ('$${{' escapes a \
-                         literal '${{')"
+                         sources/includes entries, [generate.*] \
+                         vars/argv/inputs/stdin, run-entry args/cwd/env values \
+                         ('$${{' escapes a literal '${{')"
                     )
                 }
             }
@@ -1181,6 +1185,18 @@ fn convert_dependency(
             );
         }
     }
+    // The map form's exposed (renamed-to) names claim the name-space too: a
+    // rename ONTO a builtin would be silently unreachable (ladder step 0
+    // wins) — the same manifest-that-lies §5.4's flag-day error exists for.
+    for (from, to) in &exposes_targets.renames {
+        if BUILTIN_TARGETS.contains(&to.as_str()) {
+            bail!(
+                "dependency '{dep_key}': exposes-targets renames '{from}' to \
+                 '{to}', a builtin pseudo-package; delete this entry (builtins \
+                 resolve first and cannot be shadowed)"
+            );
+        }
+    }
     for ns in &raw.exposes_namespace {
         if BUILTIN_NAMESPACES.contains(&ns.as_str()) {
             bail!(
@@ -1313,6 +1329,7 @@ fn convert_runtime_data(context: &str, raw: RawRuntimeData) -> Result<RuntimeDat
     if from.is_empty() {
         bail!("{context}: runtime-data `from` must be a non-empty directory path");
     }
+    check_contained_path(&format!("{context}: runtime-data `from`"), &from)?;
     let patterns = raw.patterns.unwrap_or_else(|| vec!["**/*".to_string()]);
     check_patterns(&format!("{context}: runtime-data patterns"), &patterns)?;
     let to = match raw.to {
@@ -1324,6 +1341,7 @@ fn convert_runtime_data(context: &str, raw: RawRuntimeData) -> Result<RuntimeDat
             .expect("rsplit yields at least one piece")
             .to_string(),
     };
+    check_contained_path(&format!("{context}: runtime-data `to`"), &to)?;
     Ok(RuntimeData { from, patterns, to })
 }
 
@@ -1331,6 +1349,7 @@ fn convert_public_headers(context: &str, raw: RawPublicHeaders) -> Result<Public
     if raw.patterns.is_empty() {
         bail!("{context}: public-headers `patterns` must be non-empty");
     }
+    check_contained_path(&format!("{context}: public-headers `base`"), &raw.base)?;
     check_patterns(&format!("{context}: public-headers patterns"), &raw.patterns)?;
     Ok(PublicHeaders {
         base: raw.base,
@@ -1339,13 +1358,36 @@ fn convert_public_headers(context: &str, raw: RawPublicHeaders) -> Result<Public
 }
 
 /// §0.4: a non-empty pattern list that is ONLY `!`-negations can never match
-/// anything — schema error (expansion itself is graph's job).
+/// anything — schema error (expansion itself is graph's job). Patterns and
+/// their expansions must also stay under their base: a `..` component (or an
+/// absolute pattern) survives the lexical strip_prefix downstream and the
+/// staged/installed copy would land OUTSIDE the staging root — silently.
 fn check_patterns(context: &str, patterns: &[String]) -> Result<()> {
     if !patterns.is_empty() && patterns.iter().all(|p| p.starts_with('!')) {
         bail!(
             "{context}: a pattern list of only '!' negations matches nothing; \
              at least one positive pattern is required"
         );
+    }
+    for p in patterns {
+        let body = p.strip_prefix('!').unwrap_or(p);
+        check_contained_path(&format!("{context}: pattern '{p}'"), body)?;
+    }
+    Ok(())
+}
+
+/// Reject absolute paths and `..` components in a path that must resolve
+/// under its declaration's base directory ("." alone is fine — public-headers
+/// `base = "."` is the abseil override).
+fn check_contained_path(context: &str, path: &str) -> Result<()> {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        bail!("{context}: absolute paths are not allowed here");
+    }
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        bail!("{context}: '..' components are not allowed here");
     }
     Ok(())
 }
@@ -1716,9 +1758,22 @@ fn convert_target(
 
 /// Dedicated-key advice for spellings that have a schema home. A warning,
 /// not an error: migrations paste flag soup, and `-UNDEBUG` has no schema
-/// home at all (benchmark's tests legitimately need it).
+/// home at all (benchmark's tests legitimately need it). ABI-classified
+/// words (`-D_GLIBCXX_DEBUG`, `-stdlib=*`) are exempt: their schema home IS
+/// the profile/[flags] layer (they must fold into dependency config hashes),
+/// so "prefer `defines`" would be actively wrong advice there.
 fn dedicated_key_warnings(scope: &str, list_name: &str, words: &[String], warnings: &mut Warnings) {
-    for w in words {
+    use crate::toolchain::FlagClass;
+    let mut abi = vec![false; words.len()];
+    for cw in crate::toolchain::classify_word_sequence(words) {
+        if matches!(cw.class, FlagClass::Abi) && cw.index < abi.len() {
+            abi[cw.index] = true;
+        }
+    }
+    for (i, w) in words.iter().enumerate() {
+        if abi[i] {
+            continue;
+        }
         let hint = if w.starts_with("-D") || w.starts_with("-U") {
             Some("defines")
         } else if w.starts_with("-I") || w.starts_with("-isystem") {
@@ -1961,6 +2016,20 @@ pub fn parse_str(text: &str) -> Result<(ProjectFile, Warnings)> {
             ],
             &mut warnings,
         );
+        // §1.4's dedicated-key advice applies to every flag list, not only
+        // target-scope ones.
+        for (list_name, words) in [
+            ("cxx-flags", &profile.cxx_flags),
+            ("c-flags", &profile.c_flags),
+            ("link-flags", &profile.link_flags),
+        ] {
+            dedicated_key_warnings(
+                &format!("profile '{name}'"),
+                list_name,
+                words,
+                &mut warnings,
+            );
+        }
         profiles.insert(name, profile);
     }
 
@@ -2017,6 +2086,24 @@ pub fn parse_str(text: &str) -> Result<(ProjectFile, Warnings)> {
                 ],
                 &mut warnings,
             );
+            // §1.4: dedicated-key advice for [flags] lists too (cfg groups
+            // included — same rule at every position of the same key).
+            for (list_name, words) in [
+                ("cxx-flags", &pf.cxx_flags),
+                ("c-flags", &pf.c_flags),
+                ("link-flags", &pf.link_flags),
+            ] {
+                dedicated_key_warnings("[flags]", list_name, words, &mut warnings);
+            }
+            for (_, group) in &pf.cfg {
+                for (list_name, words) in [
+                    ("cxx-flags", &group.cxx_flags),
+                    ("c-flags", &group.c_flags),
+                    ("link-flags", &group.link_flags),
+                ] {
+                    dedicated_key_warnings("[flags] (cfg group)", list_name, words, &mut warnings);
+                }
+            }
             pf
         }
     };

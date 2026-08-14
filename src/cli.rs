@@ -548,7 +548,22 @@ fn test(
         return Ok(());
     }
 
-    ninja_gen::run_ninja(&pb.build_dir, &[])?;
+    // §4.2 laziness: a test run activates fixture-only [generate] steps that
+    // no compile unit depends on (run-entry env/args referencing ${gen} —
+    // vtz's zoneinfo). ninja's default set deliberately excludes cppkg-gen,
+    // so request it explicitly alongside the planned targets whenever the
+    // plan activated any step; otherwise the fixture is silently missing.
+    let ninja_targets: Vec<String> = if pb.plan.gen_steps.is_empty() {
+        Vec::new() // defaults
+    } else {
+        pb.plan
+            .targets
+            .iter()
+            .map(|t| t.name.clone())
+            .chain(std::iter::once("cppkg-gen".to_string()))
+            .collect()
+    };
+    ninja_gen::run_ninja(&pb.build_dir, &ninja_targets)?;
     run_invocations(&sess.root, invocations, jobs, verbose)
 }
 
@@ -638,8 +653,12 @@ fn run_one(root: &Path, inv: &Invocation) -> RunOutcome {
             } else {
                 root.join(p)
             };
+            // Lexically resolve `.`/`..` before the inside-build-tree check:
+            // `build/../../elsewhere` must not pass a raw starts_with and get
+            // auto-created outside the project ("resolves inside", §3.2).
+            let abs = lexical_normalize(&abs);
             if !abs.is_dir() {
-                if abs.starts_with(root.join("build")) {
+                if abs.starts_with(lexical_normalize(&root.join("build"))) {
                     if let Err(e) = fs::create_dir_all(&abs) {
                         return RunOutcome {
                             passed: false,
@@ -706,6 +725,33 @@ fn run_one(root: &Path, inv: &Invocation) -> RunOutcome {
         detail,
         output: captured,
     }
+}
+
+/// Lexically resolve `.` and `..` components (no filesystem access — the
+/// path may not exist yet; symlinks are deliberately not chased). `..` at
+/// the root sticks to the root, so an escape attempt can never normalize
+/// back inside.
+fn lexical_normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Pop a real component; keep prefix/root anchors in place.
+                if !matches!(
+                    out.components().next_back(),
+                    None | Some(Component::RootDir) | Some(Component::Prefix(_))
+                ) {
+                    out.pop();
+                } else if !out.has_root() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 fn describe_status(status: &std::process::ExitStatus) -> String {
@@ -1039,15 +1085,15 @@ fn requested_human(requested: &str) -> String {
         .to_string()
 }
 
-fn interp_step_string(step: &str, raw: &str, ictx: &InterpCtx) -> Result<String> {
-    interp::interpolate(raw, InterpPos::GenerateVarOrArgv, ictx)
+fn interp_step_string(step: &str, raw: &str, pos: InterpPos, ictx: &InterpCtx) -> Result<String> {
+    interp::interpolate(raw, pos, ictx)
         .map_err(|e| anyhow!("generate step `{step}`: in `{raw}`: {e}"))
 }
 
 /// Resolve a step-declared path: interpolated (absolute ${gen} allowed),
 /// then anchored at the project root when relative.
 fn step_path(root: &Path, step: &str, raw: &str, ictx: &InterpCtx) -> Result<PathBuf> {
-    let s = interp_step_string(step, raw, ictx)?;
+    let s = interp_step_string(step, raw, InterpPos::GenerateArgv, ictx)?;
     let p = PathBuf::from(&s);
     Ok(if p.is_absolute() { p } else { root.join(p) })
 }
@@ -1073,14 +1119,19 @@ fn execute_gen_step(root: &Path, step: &GenerateStep, ictx: &InterpCtx) -> Resul
             let tpath = step_path(root, &step.name, template, ictx)?;
             let mut ivars = BTreeMap::new();
             for (k, v) in vars {
-                ivars.insert(k.clone(), interp_step_string(&step.name, v, ictx)?);
+                // Vars carry package/pin identity only — the §0.3 table
+                // grants ${gen} to argv, not vars.
+                ivars.insert(
+                    k.clone(),
+                    interp_step_string(&step.name, v, InterpPos::GenerateVar, ictx)?,
+                );
             }
             substitute_template(&step.name, &tpath, &ivars)
         }
         GenerateAction::Command { argv, stdin, .. } => {
             let mut iargv = Vec::with_capacity(argv.len());
             for a in argv {
-                iargv.push(interp_step_string(&step.name, a, ictx)?);
+                iargv.push(interp_step_string(&step.name, a, InterpPos::GenerateArgv, ictx)?);
             }
             let stdin_path = match stdin {
                 Some(s) => Some(step_path(root, &step.name, s, ictx)?),
@@ -1554,9 +1605,13 @@ fn prepare_dependencies(
         let locked = lockfile.matching_entry(key, &source, &requested);
         let empty: Vec<(String, Vec<u8>)> = Vec::new();
         let labeled = result.patch_bytes.get(key).unwrap_or(&empty);
+        // read_patches reads spec.patches in declaration order, so the two
+        // run parallel — the declared path rides along so a hunk failure can
+        // name WHICH patch file to re-diff (§5.2).
         let patches: Vec<(PathBuf, Vec<u8>)> = labeled
             .iter()
-            .map(|(_, bytes)| (PathBuf::new(), bytes.clone()))
+            .zip(&spec.patches)
+            .map(|((_, bytes), declared)| (declared.clone(), bytes.clone()))
             .collect();
         let raw = fetch::ensure(&stores, key, spec, locked, &patches)?;
 
@@ -1620,8 +1675,12 @@ fn prepare_dependencies(
             .collect();
 
         let manifest_path = stores.manifest_path(&entry_dir);
+        // A.8: extraction notes print on fresh derivations (probe/re-probe)
+        // only, never replayed on cached-manifest reads.
+        let mut fresh_manifest = true;
         let manifest = if stores.entry_complete(&entry_dir) {
             if manifest_path.is_file() {
+                fresh_manifest = false;
                 Manifest::load(&manifest_path)?
             } else {
                 // A.8: complete entry, older extractor's manifest — the
@@ -1678,8 +1737,10 @@ fn prepare_dependencies(
             allow_undeclared,
         )?;
 
-        for note in &manifest.notes {
-            eprintln!("cpp-pkg: note ({key}): {note}");
+        if fresh_manifest {
+            for note in &manifest.notes {
+                eprintln!("cpp-pkg: note ({key}): {note}");
+            }
         }
 
         result.manifests.insert(key.clone(), manifest);

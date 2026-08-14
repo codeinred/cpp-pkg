@@ -81,7 +81,7 @@ grammar cannot creep.
 | `${package.version}` (+ `.major/.minor/.patch`) | `[package].version` (error if unset; component error if non-integer) | same |
 | `${pin.<depkey>.commit}` | resolved commit sha from CppPkg.lock (base commit — never the patch-composed id, §5.2) | defines values; `[generate.*]` vars/argv |
 | `${pin.<depkey>.requested}` | human ref (`v1.9.5` for `tag:`, sha for `rev:`) | same |
-| `${gen}` | the generated-output root `build/gen/` | `sources`/`includes` entries; `[generate.*]` argv; run-entry `args`/`cwd`/`env` values |
+| `${gen}` | the generated-output root `build/gen/` | `sources`/`includes` entries; `[generate.*]` argv, `inputs` entries, and `stdin` (a `${gen}` input creates the producer edge implicitly, §4.1); run-entry `args`/`cwd`/`env` values |
 | `${project-root}`, `${build-dir}` | absolute paths | run-entry `args`/`cwd`/`env` values |
 | `${install-prefix}` | `install --prefix` value; default `/usr/local` (overridable via `build --prefix`) | defines values only |
 | `${pin.self.*}` | **reserved, not implemented.** When implemented: resolves from the consumer's lockfile in dependency mode; in a root build it is a **hard error** ("only meaningful when built as a dependency; use `${package.version}`") | — |
@@ -1233,3 +1233,23 @@ implementers have one document:
 10. **Misc:** per-config build dirs (cpptrace); lint unknown dep `options`
     keys (cpptrace); flag-ordering last-wins is now normative contract via
     §1.3 (closes the documentation item).
+
+---
+
+## Amendments (architect ratification after the S3 fix pass, 2026-08-14)
+
+1. **§0.3 position table corrected** to include `[generate.*].inputs`/`stdin`
+   for `${gen}` (was under-inclusive; §4.1 was and remains normative).
+2. **SDK-sysroot allow-list exemption in the hermeticity scan: RATIFIED.**
+   §5.5's invariant is satisfied — SDK contents are covered by the hashed
+   `sdk_version` in the toolchain identity; the exemption is load-bearing for
+   FindZLIB-style SDK .tbd references and inert on Linux. §5.5's contrary
+   sentence is superseded by this amendment.
+3. **url dependencies lock lazily: RATIFIED.** The declared `sha256` already
+   pins content machine-independently; eager locking would require fetching
+   bytes at lock time for no integrity gain.
+4. **Release notes owed for the next tagged release:** one-time whole-project
+   relink (link-rule argv order change, §1.3; store keys untouched);
+   transported-ABI flag re-key note from the correctness review.
+5. **Recorded open holes (deliberate, tracked):** response-file flag
+   laundering not yet classified; per-config build dirs (A.10) deferred.

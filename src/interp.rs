@@ -50,9 +50,14 @@ pub struct InterpCtx<'a> {
 pub enum InterpPos {
     /// Define *values* (`KEY=VALUE` entries, after the `=`).
     DefineValue,
-    /// `[generate.<name>]` template vars and command argv words.
-    GenerateVarOrArgv,
-    /// `sources` / `includes` list entries.
+    /// `[generate.<name>]` template vars: package/pin identity only — the
+    /// §0.3 table grants `${gen}` to generate *argv*, not vars.
+    GenerateVar,
+    /// `[generate.<name>]` command argv words (and stdin, which shares the
+    /// argv vocabulary).
+    GenerateArgv,
+    /// `sources` / `includes` list entries — and `[generate.*].inputs`,
+    /// which are file paths with the same `${gen}`-only vocabulary.
     SourceOrIncludeEntry,
     /// Run-entry `args` / `cwd` / `env` values.
     RunEntryValue,
@@ -66,7 +71,11 @@ impl InterpPos {
                 "${package.name}, ${package.version}(.major/.minor/.patch), \
                  ${pin.<dep>.commit}, ${pin.<dep>.requested}, ${install-prefix}"
             }
-            InterpPos::GenerateVarOrArgv => {
+            InterpPos::GenerateVar => {
+                "${package.name}, ${package.version}(.major/.minor/.patch), \
+                 ${pin.<dep>.commit}, ${pin.<dep>.requested}"
+            }
+            InterpPos::GenerateArgv => {
                 "${package.name}, ${package.version}(.major/.minor/.patch), \
                  ${pin.<dep>.commit}, ${pin.<dep>.requested}, ${gen}"
             }
@@ -148,7 +157,7 @@ fn resolve(var: &str, pos: InterpPos, ctx: &InterpCtx, whole: &str) -> Result<St
 
     let allowed_package_and_pin = matches!(
         pos,
-        InterpPos::DefineValue | InterpPos::GenerateVarOrArgv
+        InterpPos::DefineValue | InterpPos::GenerateVar | InterpPos::GenerateArgv
     );
 
     match var {
@@ -197,7 +206,7 @@ fn resolve(var: &str, pos: InterpPos, ctx: &InterpCtx, whole: &str) -> Result<St
         "gen" => {
             let ok = matches!(
                 pos,
-                InterpPos::GenerateVarOrArgv
+                InterpPos::GenerateArgv
                     | InterpPos::SourceOrIncludeEntry
                     | InterpPos::RunEntryValue
             );
@@ -345,7 +354,7 @@ mod tests {
         );
         let c = ctx(&pins);
         assert_eq!(
-            interpolate("${pin.date.commit}", InterpPos::GenerateVarOrArgv, &c).unwrap(),
+            interpolate("${pin.date.commit}", InterpPos::GenerateArgv, &c).unwrap(),
             "abc123"
         );
         assert_eq!(
@@ -363,7 +372,7 @@ mod tests {
     fn interp_pin_self_reserved_everywhere() {
         let pins = BTreeMap::new();
         let c = ctx(&pins);
-        for pos in [InterpPos::DefineValue, InterpPos::GenerateVarOrArgv] {
+        for pos in [InterpPos::DefineValue, InterpPos::GenerateArgv] {
             let e = format!(
                 "{:#}",
                 interpolate("${pin.self.requested}", pos, &c).unwrap_err()

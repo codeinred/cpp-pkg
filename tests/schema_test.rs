@@ -1278,6 +1278,14 @@ fn schema_builtin_claims_are_flag_day_errors() {
         "date = { git = \"https://x\", tag = \"1\", exposes-namespace = [\"Threads\"] }",
     ));
     assert!(e.contains("builtin pseudo-package; delete this line"), "{e}");
+
+    // The map form renaming ONTO the builtin is the same lie: ladder step 0
+    // wins and the rename would be silently unreachable.
+    let e = err(&with_dep(
+        "date = { git = \"https://x\", tag = \"1\", exposes-targets = { \"x::y\" = \"Threads::Threads\" } }",
+    ));
+    assert!(e.contains("builtin pseudo-package"), "{e}");
+    assert!(e.contains("renames"), "{e}");
 }
 
 #[test]
@@ -1384,6 +1392,47 @@ runtime-data = [
          runtime-data = [{{ from = \"cfg\", patterns = [\"!*.bad\"] }}]\n"
     ));
     assert!(e.contains("only '!' negations"), "{e}");
+}
+
+#[test]
+fn schema_staging_paths_reject_parent_escapes() {
+    // A `..` component survives the lexical strip_prefix downstream and the
+    // staged copy would silently land OUTSIDE the staging root.
+    let e = err(&format!(
+        "{MINIMAL}\n[targets.t]\ntype = \"executable\"\nsources = [\"a.cpp\"]\n\
+         runtime-data = [{{ from = \"cfg\", patterns = [\"../secrets.cfg\"] }}]\n"
+    ));
+    assert!(e.contains("'..' components"), "{e}");
+
+    let e = err(&format!(
+        "{MINIMAL}\n[targets.t]\ntype = \"executable\"\nsources = [\"a.cpp\"]\n\
+         runtime-data = [{{ from = \"../cfg\" }}]\n"
+    ));
+    assert!(e.contains("'..' components"), "{e}");
+
+    let e = err(&format!(
+        "{MINIMAL}\n[targets.t]\ntype = \"executable\"\nsources = [\"a.cpp\"]\n\
+         runtime-data = [{{ from = \"cfg\", to = \"../elsewhere\" }}]\n"
+    ));
+    assert!(e.contains("'..' components"), "{e}");
+
+    let e = err(&format!(
+        "{MINIMAL}\n[targets.t]\ntype = \"static-library\"\nsources = [\"a.cpp\"]\n\
+         public-headers = {{ base = \"..\", patterns = [\"*.h\"] }}\n"
+    ));
+    assert!(e.contains("'..' components"), "{e}");
+
+    let e = err(&format!(
+        "{MINIMAL}\n[targets.t]\ntype = \"static-library\"\nsources = [\"a.cpp\"]\n\
+         public-headers = {{ base = \".\", patterns = [\"/abs/*.h\"] }}\n"
+    ));
+    assert!(e.contains("absolute paths"), "{e}");
+
+    // `base = "."` (the abseil override) stays legal.
+    ok(&format!(
+        "{MINIMAL}\n[targets.t]\ntype = \"static-library\"\nsources = [\"a.cpp\"]\n\
+         public-headers = {{ base = \".\", patterns = [\"absl/**/*.h\"] }}\n"
+    ));
 }
 
 // ===========================================================================
@@ -1558,6 +1607,33 @@ test = true
 args = ["--data", "${{gen}}/zoneinfo"]
 cwd  = "build/scratch"
 env  = {{ VTZ_TZDATA_PATH = "${{gen}}/zoneinfo", ROOT = "${{project-root}}" }}
+"#
+    );
+    ok(&text);
+}
+
+#[test]
+fn schema_interp_gen_inputs_and_stdin_accepted() {
+    // §4.1: a ${gen} input (or stdin) that is another step's output is the
+    // implicit inter-step ordering mechanism — the placement whitelist must
+    // admit it or no manifest can ever chain steps.
+    let text = format!(
+        r#"{MINIMAL}
+[generate.step-a]
+command = ["python3", "scripts/gen_a.py"]
+stdout  = "a.h"
+inputs  = ["scripts/gen_a.py"]
+
+[generate.step-b]
+command = ["python3", "scripts/gen_b.py"]
+stdin   = "${{gen}}/a.h"
+stdout  = "b.h"
+inputs  = ["scripts/gen_b.py", "${{gen}}/a.h"]
+
+[targets.t]
+type = "executable"
+sources = ["src/main.cpp"]
+includes = {{ private = ["${{gen}}"] }}
 "#
     );
     ok(&text);

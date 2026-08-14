@@ -412,9 +412,12 @@ pub struct HermeticityAllow {
 
 /// §5.5 layer 1: police the invariant that every absolute path a manifest
 /// records is covered by some hash input. Scans artifact locations, include
-/// dirs, link paths, and interface sources; framework references survive
-/// extraction as bare names, never paths, so there is nothing to scan there.
-/// SDK-rooted paths are deliberately not exempt.
+/// dirs, link paths, interface sources, AND absolute paths embedded in
+/// link-option flag words (`-L/opt/...`, `-Wl,-rpath,/opt/...`, bare
+/// `/opt/.../libx.a` words — the transports a config-mode package can use to
+/// smuggle an undeclared machine path past the path-typed fields); framework
+/// references survive extraction as bare names, never paths, so there is
+/// nothing to scan there. SDK-rooted paths are deliberately not exempt.
 ///
 /// Runs on probe output and on every cached-manifest read (the caller — cli —
 /// wires the allow-list and decides error vs. warning via
@@ -429,6 +432,18 @@ pub fn scan_hermeticity(m: &Manifest, allow: &HermeticityAllow) -> Vec<Leak> {
     };
     let mut leaks = Vec::new();
     for (name, c) in &m.components {
+        let mut record = |p: &Path| {
+            if !p.is_absolute() || allowed(p) {
+                return;
+            }
+            let leak = Leak {
+                component: name.clone(),
+                path: p.to_path_buf(),
+            };
+            if !leaks.contains(&leak) {
+                leaks.push(leak);
+            }
+        };
         let paths = c
             .location
             .values()
@@ -437,19 +452,36 @@ pub fn scan_hermeticity(m: &Manifest, allow: &HermeticityAllow) -> Vec<Leak> {
             .chain(c.link_paths.iter())
             .chain(c.interface_sources.iter());
         for p in paths {
-            if !p.is_absolute() || allowed(p) {
-                continue;
-            }
-            let leak = Leak {
-                component: name.clone(),
-                path: p.clone(),
-            };
-            if !leaks.contains(&leak) {
-                leaks.push(leak);
+            record(p);
+        }
+        for word in &c.link_options {
+            for p in absolute_paths_in_flag_word(word) {
+                record(Path::new(p));
             }
         }
     }
     leaks
+}
+
+/// Absolute paths carried inside one link-option flag word. Recognized
+/// transports: a bare absolute word, `-L/`-style single-word prefixes
+/// (`-L`, `-F`, `-I`, `-isystem`, `--sysroot=`), and `-Wl,`/`-Xlinker`
+/// comma-payloads whose pieces start with `/` (covers `-Wl,-rpath,/x`).
+fn absolute_paths_in_flag_word(word: &str) -> Vec<&str> {
+    if word.starts_with('/') {
+        return vec![word];
+    }
+    for prefix in ["-L", "-F", "-I", "-isystem", "--sysroot="] {
+        if let Some(rest) = word.strip_prefix(prefix)
+            && rest.starts_with('/')
+        {
+            return vec![rest];
+        }
+    }
+    if let Some(payload) = word.strip_prefix("-Wl,") {
+        return payload.split(',').filter(|p| p.starts_with('/')).collect();
+    }
+    Vec::new()
 }
 
 /// Look up a property, treating empty and CMake "-NOTFOUND" values as unset.
@@ -1242,6 +1274,41 @@ mod tests {
             sysdep_paths: vec![PathBuf::from("/opt/homebrew")],
         };
         assert!(scan_hermeticity(&m, &allow).is_empty());
+    }
+
+    #[test]
+    fn manifest_scan_hermeticity_covers_link_option_words() {
+        // §5.5 layer 1 must also catch absolute paths riding flag words —
+        // -L / -Wl,-rpath / bare-path transports evade the path-typed fields.
+        let mut c = interface_component();
+        c.link_options = vec![
+            "-L/opt/homebrew/lib".to_string(),
+            "-Wl,-rpath,/opt/homebrew/lib".to_string(),
+            "/usr/local/lib/libweird.a".to_string(),
+            "-L/store/pkg/x/install/lib".to_string(), // store-rooted: allowed
+            "-lm".to_string(),                        // no path: ignored
+        ];
+        let m = Manifest {
+            package: "dep".to_string(),
+            components: BTreeMap::from([("z::z".to_string(), c)]),
+            notes: vec![],
+        };
+        let allow = HermeticityAllow {
+            store_roots: vec![PathBuf::from("/store")],
+            sysdep_paths: vec![],
+        };
+        let leaks: Vec<PathBuf> = scan_hermeticity(&m, &allow)
+            .into_iter()
+            .map(|l| l.path)
+            .collect();
+        assert_eq!(
+            leaks,
+            vec![
+                PathBuf::from("/opt/homebrew/lib"),
+                PathBuf::from("/usr/local/lib/libweird.a"),
+            ],
+            "-L and -Wl,-rpath payloads dedupe to one leak; bare word flagged"
+        );
     }
 
     #[test]

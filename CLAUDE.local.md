@@ -179,6 +179,29 @@ remembering:
 - A.10 per-config build dirs deferred: ninja derives roots from
   `<root>/build`; give write_ninja explicit roots before changing that.
 
+Fix pass (post-review, 2026-08-14): ${gen} now legal in [generate.*]
+inputs/stdin (inter-step chaining was unreachable — BLOCKER); `cpp-pkg
+test` builds cppkg-gen so fixture-only steps run; link rule is now
+`-o $out $in $link_flags $libs` (§1.3 order — deliberate golden change,
+one-time relink on upgrade, release-note it); SystemLib/Framework link
+inputs are contributor-keyed keep-last like flag words (diamond `-lrt`
+under --as-needed); runtime-data zero-match is a hard error on the build
+side too; `..`/absolute rejected in runtime-data from/to/patterns and
+public-headers base/patterns; run-entry cwd rule lexically normalizes
+before the inside-build check; patch failures name the patch file;
+exposes-targets map form renaming ONTO a builtin errors; §5.5 scan covers
+link_options words (-L/-Wl,-rpath//abs transports); notes no longer replay
+on cached-manifest reads; template vars reject ${gen} (argv-only);
+dedicated-key warnings extended to [flags]/profiles with ABI words exempt
+(their home IS the profile layer). Upheld deviations (architect should
+re-ratify): SDK-sysroot allow-list in both leak layers (curl SDK zlib is
+load-bearing; sdk_version is hashed so the §5.5 invariant holds; revisit
+on Linux where it is inert); url deps lock on first provisioning;
+[flags]-ABI via effective-profile head; dev-dep provisioning superset.
+Not fixed (needs a design ruling): public define VALUES embedding
+absolute paths export unchecked ('/'-leading values can be non-filesystem
+strings, blanket error would false-positive).
+
 ## Notes to future me (things I care about)
 
 - The corpus-driven paradigm is the project's soul now: features come from
