@@ -142,6 +142,17 @@ dropped SecureTransport (pin 8_14_1 for hermetic macOS TLS); new
 frontiers: Linux (user), tier-3 extraction, --path/--with, INTERFACE_SOURCES
 real-world validation, alias resolution in probe.
 
+## PICKUP FIRST (wound down 2026-08-14 at weekly session limit)
+
+Mid-S4. Read CAMPAIGN.md "PICKUP" section — it is the authoritative
+restart checklist (adapted workflow script at
+tools/s4-remigration.workflow.js; 5/8 re-migrations done and committed;
+vtz/cppcheck/abseil + verdict remain; then loop-or-Linux decision; keres
+awaits). MORNING_REPORT.md is current through S3 + wind-down status —
+Alecto reviews it in depth; keep maintaining it. Prior session's workflow
+caches + scratchpad stores are unreachable — fresh stores, expect dep
+rebuild minutes.
+
 ## Autonomous campaign (2026-08-14 →)
 
 CAMPAIGN.md is the plan: S1 migrations (macOS) → S2 design w/ dedicated
