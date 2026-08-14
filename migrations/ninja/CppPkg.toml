@@ -1,0 +1,203 @@
+# cpp-pkg migration of ninja-build/ninja v1.13.2 (macOS/posix configuration).
+# Source of truth lives in cpp-pkg's migrations/ninja/; pin.sh copies it next
+# to the upstream checkout. See README.md and GAPS.md alongside this file.
+
+schema-version = 1
+
+[package]
+name = "ninja"
+version = "1.13.2"
+
+# GoogleTest is a TEST-ONLY dependency upstream (only fetched when
+# BUILD_TESTING=ON and no system GTest). cpp-pkg has no dev-dependency
+# notion, so it is a full dependency of the project: even `cpp-pkg build
+# ninja` fetches and builds it. (GAPS.md: testing-story.)
+#
+# v1.16.0 matches the exact version upstream pins via FetchContent
+# (URL tarball + SHA256); we express it as a git tag instead because that is
+# the idiomatic cpp-pkg form. Installed GTest exports the `GTest::` namespace
+# from GTestConfig.cmake, so the probe must call find_package(GTest), not
+# find_package(googletest) — hence `find-package`.
+[dependencies.googletest]
+git = "https://github.com/google/googletest"
+tag = "v1.16.0"
+find-package = "GTest"
+options = { BUILD_GMOCK = "OFF" }
+
+# Upstream applies -Wno-deprecated globally (add_compile_options after a
+# compiler check). cpp-pkg's only flag mechanism is per-PROFILE consumer
+# flags, so the flag must be repeated once per built-in profile to cover any
+# --config value; there is no per-target or profile-independent flag slot.
+# (GAPS.md: per-target-flags, schema-ergonomics.)
+[profiles.release]
+cxx-flags = ["-Wno-deprecated"]
+
+[profiles.debug]
+cxx-flags = ["-Wno-deprecated"]
+
+[profiles.relwithdebinfo]
+cxx-flags = ["-Wno-deprecated"]
+
+[profiles.minsizerel]
+cxx-flags = ["-Wno-deprecated"]
+
+# ---------------------------------------------------------------------------
+# Upstream builds libninja and libninja-re2c as CMake OBJECT libraries.
+# cpp-pkg has no object-library kind, so both are static archives here; the
+# observable difference (archives pull members by undefined-symbol need,
+# object libs link everything) does not bite ninja — no self-registration
+# patterns. (GAPS.md: object-libraries.)
+
+# Core sources, POSIX/macOS flavor. Upstream lists 27 platform-neutral files
+# and appends jobserver-posix.cc + subprocess-posix.cc inside if(NOT WIN32).
+# cpp-pkg has no conditional sources, so this list is hard-wired to the posix
+# set and the manifest is not portable to Windows. A naive glob (src/*.cc)
+# is impossible: it would sweep in *_test.cc, *_perftest.cc, *-win32.cc,
+# browse.cc, ninja.cc and the re2c inputs (*.in.cc also match *.cc).
+# (GAPS.md: conditional-sources.)
+[targets.libninja]
+type = "static-library"
+cxx-std = 11
+sources = [
+    "src/build_log.cc",
+    "src/build.cc",
+    "src/clean.cc",
+    "src/clparser.cc",
+    "src/dyndep.cc",
+    "src/dyndep_parser.cc",
+    "src/debug_flags.cc",
+    "src/deps_log.cc",
+    "src/disk_interface.cc",
+    "src/edit_distance.cc",
+    "src/elide_middle.cc",
+    "src/eval_env.cc",
+    "src/graph.cc",
+    "src/graphviz.cc",
+    "src/jobserver.cc",
+    "src/json.cc",
+    "src/line_printer.cc",
+    "src/manifest_parser.cc",
+    "src/metrics.cc",
+    "src/missing_deps.cc",
+    "src/parser.cc",
+    "src/real_command_runner.cc",
+    "src/state.cc",
+    "src/status_printer.cc",
+    "src/string_piece_util.cc",
+    "src/util.cc",
+    "src/version.cc",
+    # posix-only pair (WIN32 uses subprocess-win32.cc, jobserver-win32.cc,
+    # includes_normalize-win32.cc, msvc_helper-win32.cc,
+    # msvc_helper_main-win32.cc, minidump-win32.cc, getopt.c):
+    "src/jobserver-posix.cc",
+    "src/subprocess-posix.cc",
+]
+
+# Upstream: pre-generated re2c outputs compiled as their own object library
+# (regenerated at build time only if re2c >= 2 is installed; this machine has
+# no re2c, so the CMake baseline also compiles the committed files —
+# byte-for-byte the same inputs as here). (GAPS.md: codegen-escape-hatch.)
+[targets.libninja-re2c]
+type = "static-library"
+cxx-std = 11
+sources = ["src/depfile_parser.cc", "src/lexer.cc"]
+includes = { private = ["src"] }
+
+# The ninja binary: main() + browse mode. Upstream inlines src/browse.py into
+# a generated header via `src/inline.sh kBrowsePy < src/browse.py >
+# build/browse_py.h` (add_custom_command). cpp-pkg has no codegen step, so
+# pin.sh pre-generates gen/build/browse_py.h with the same command and this
+# target adds `gen` as a private include dir (browse.cc does
+# `#include "build/browse_py.h"`). (GAPS.md: codegen-escape-hatch.)
+#
+# NINJA_PYTHON/NINJA_HAVE_BROWSE are per-SOURCE-FILE properties upstream
+# (set_source_files_properties on browse.cc); here they are target-wide,
+# which is harmless for this project. (GAPS.md: per-target-flags.)
+[targets.ninja]
+type = "executable"
+cxx-std = 11
+sources = ["src/ninja.cc", "src/browse.cc"]
+includes = { private = ["gen"] }
+defines = { private = ["NINJA_HAVE_BROWSE", 'NINJA_PYTHON="python"'] }
+dependencies = ["libninja", "libninja-re2c"]
+
+# Tests: upstream's exact non-WIN32 ninja_test source list. GTest v1.16
+# requires C++14, hence the bump from 11 (upstream gets the same effect via
+# feature-max between cxx_std_11 and gtest's INTERFACE requirement).
+# Upstream also links Threads::Threads; on macOS pthreads live in libSystem,
+# so no explicit edge is needed (GTestConfig's find_dependency(Threads) is
+# handled inside the probe). (GAPS.md: dep-provisioning.)
+[targets.ninja_test]
+type = "executable"
+cxx-std = 14
+sources = [
+    "src/build_log_test.cc",
+    "src/build_test.cc",
+    "src/clean_test.cc",
+    "src/clparser_test.cc",
+    "src/depfile_parser_test.cc",
+    "src/deps_log_test.cc",
+    "src/disk_interface_test.cc",
+    "src/dyndep_parser_test.cc",
+    "src/edit_distance_test.cc",
+    "src/elide_middle_test.cc",
+    "src/explanations_test.cc",
+    "src/graph_test.cc",
+    "src/jobserver_test.cc",
+    "src/json_test.cc",
+    "src/lexer_test.cc",
+    "src/manifest_parser_test.cc",
+    "src/missing_deps_test.cc",
+    "src/ninja_test.cc",
+    "src/state_test.cc",
+    "src/string_piece_util_test.cc",
+    "src/subprocess_test.cc",
+    "src/test.cc",
+    "src/util_test.cc",
+]
+dependencies = ["libninja", "libninja-re2c", "GTest::gtest"]
+
+# Perf/bench executables (upstream builds these under BUILD_TESTING via a
+# foreach loop — 4 CMake lines for 7 targets; here: 7 near-identical stanzas.
+# (GAPS.md: schema-ergonomics.)
+[targets.build_log_perftest]
+type = "executable"
+cxx-std = 11
+sources = ["src/build_log_perftest.cc"]
+dependencies = ["libninja", "libninja-re2c"]
+
+[targets.canon_perftest]
+type = "executable"
+cxx-std = 11
+sources = ["src/canon_perftest.cc"]
+dependencies = ["libninja", "libninja-re2c"]
+
+[targets.clparser_perftest]
+type = "executable"
+cxx-std = 11
+sources = ["src/clparser_perftest.cc"]
+dependencies = ["libninja", "libninja-re2c"]
+
+[targets.depfile_parser_perftest]
+type = "executable"
+cxx-std = 11
+sources = ["src/depfile_parser_perftest.cc"]
+dependencies = ["libninja", "libninja-re2c"]
+
+[targets.elide_middle_perftest]
+type = "executable"
+cxx-std = 11
+sources = ["src/elide_middle_perftest.cc"]
+dependencies = ["libninja", "libninja-re2c"]
+
+[targets.hash_collision_bench]
+type = "executable"
+cxx-std = 11
+sources = ["src/hash_collision_bench.cc"]
+dependencies = ["libninja", "libninja-re2c"]
+
+[targets.manifest_parser_perftest]
+type = "executable"
+cxx-std = 11
+sources = ["src/manifest_parser_perftest.cc"]
+dependencies = ["libninja", "libninja-re2c"]

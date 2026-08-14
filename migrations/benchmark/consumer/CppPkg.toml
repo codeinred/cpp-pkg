@@ -1,0 +1,32 @@
+# Declare-as-dependency mode: consume google/benchmark v1.9.5 the normal
+# cpp-pkg way (git dep -> CMake build into store -> tier-2 probe of the
+# installed benchmarkConfig.cmake -> imported targets).
+#
+# benchmark::benchmark / benchmark::benchmark_main are genuine IMPORTED
+# targets in the installed benchmarkTargets.cmake (unlike e.g. curl's
+# CURL::libcurl ALIAS), so the probe sees them directly.
+#
+# benchmarkConfig.cmake calls find_dependency(Threads) — a CMake find-module,
+# not a package config, so no `needs` entry exists or is needed for it.
+
+schema-version = 1
+
+[package]
+name = "benchmark-consumer"
+version = "0.1.0"
+
+[dependencies.benchmark]
+git = "https://github.com/google/benchmark"
+tag = "v1.9.5"
+# Skip tests (would fetch googletest via BENCHMARK_USE_BUNDLED_GTEST) and
+# doc/tool payload; the library targets and config files still install.
+[dependencies.benchmark.options]
+BENCHMARK_ENABLE_TESTING = "OFF"
+BENCHMARK_INSTALL_DOCS = "OFF"
+BENCHMARK_INSTALL_TOOLS = "OFF"
+
+[targets.bench-demo]
+type = "executable"
+cxx-std = 17
+sources = ["src/main.cc"]
+dependencies = ["benchmark::benchmark_main"]

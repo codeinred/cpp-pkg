@@ -1,0 +1,123 @@
+# googletest v1.18.0 built by cpp-pkg. This file is copied to the upstream
+# checkout root by pin.sh; sources/includes are relative to that root.
+#
+# Mirrors the non-MSVC path of upstream's community CMake build:
+#   - umbrella compilation (gtest-all.cc / gmock-all.cc), one object per lib,
+#     same as upstream's cxx_library() calls
+#   - the source dir itself (googletest/, googlemock/) is on the include path:
+#     needed privately so gtest-all.cc can `#include "src/gtest.cc"`, and
+#     upstream also exports it in its INTERFACE include dirs (gtest_build_
+#     include_dirs goes into target_include_directories(... SYSTEM INTERFACE)),
+#     so it is public here for parity.
+#   - cxx_std_17 is PUBLIC in upstream (target_compile_features); cpp-pkg has
+#     no propagating cxx-std, so each consumer target repeats cxx-std = 17.
+#   - GTEST_HAS_PTHREAD=1: upstream passes -DGTEST_HAS_PTHREAD=1 in
+#     COMPILE_FLAGS (private) when find_package(Threads) succeeds; private
+#     define here. Consumers rely on gtest-port.h autodetection (as with
+#     upstream's installed package).
+#   - upstream's strict warning set (-Wall -Wshadow -Wconversion -Wundef -W
+#     -Wpointer-arith ... on the libs only) is NOT reproduced: cpp-pkg has no
+#     per-target flags. See GAPS.md (per-target-flags).
+
+schema-version = 1
+
+[package]
+name = "googletest"
+version = "1.18.0"
+
+# ---------------------------------------------------------------- libraries
+
+[targets.gtest]
+type = "static-library"
+sources = ["googletest/src/gtest-all.cc"]
+cxx-std = 17
+includes = { public = ["googletest/include", "googletest"] }
+defines = { private = ["GTEST_HAS_PTHREAD=1"] }
+
+[targets.gtest_main]
+type = "static-library"
+sources = ["googletest/src/gtest_main.cc"]
+cxx-std = 17
+defines = { private = ["GTEST_HAS_PTHREAD=1"] }
+dependencies = { public = ["gtest"] }
+
+[targets.gmock]
+type = "static-library"
+sources = ["googlemock/src/gmock-all.cc"]
+cxx-std = 17
+includes = { public = ["googlemock/include", "googlemock"] }
+defines = { private = ["GTEST_HAS_PTHREAD=1"] }
+dependencies = { public = ["gtest"] }
+
+[targets.gmock_main]
+type = "static-library"
+sources = ["googlemock/src/gmock_main.cc"]
+cxx-std = 17
+defines = { private = ["GTEST_HAS_PTHREAD=1"] }
+dependencies = { public = ["gmock"] }
+
+# ---------------------------------------------------------------- samples
+# Upstream builds these only under -Dgtest_build_samples=ON; cpp-pkg has no
+# option-gated targets, so they are unconditional here (GAPS.md:
+# testing-story / conditional-sources). Source lists mirror
+# cxx_executable(<name> samples <lib> [extra srcs]) exactly.
+
+[targets.sample1_unittest]
+type = "executable"
+sources = ["googletest/samples/sample1_unittest.cc", "googletest/samples/sample1.cc"]
+cxx-std = 17
+dependencies = ["gtest_main"]
+
+[targets.sample2_unittest]
+type = "executable"
+sources = ["googletest/samples/sample2_unittest.cc", "googletest/samples/sample2.cc"]
+cxx-std = 17
+dependencies = ["gtest_main"]
+
+[targets.sample3_unittest]
+type = "executable"
+sources = ["googletest/samples/sample3_unittest.cc"]
+cxx-std = 17
+dependencies = ["gtest_main"]
+
+[targets.sample4_unittest]
+type = "executable"
+sources = ["googletest/samples/sample4_unittest.cc", "googletest/samples/sample4.cc"]
+cxx-std = 17
+dependencies = ["gtest_main"]
+
+[targets.sample5_unittest]
+type = "executable"
+sources = ["googletest/samples/sample5_unittest.cc", "googletest/samples/sample1.cc"]
+cxx-std = 17
+dependencies = ["gtest_main"]
+
+[targets.sample6_unittest]
+type = "executable"
+sources = ["googletest/samples/sample6_unittest.cc"]
+cxx-std = 17
+dependencies = ["gtest_main"]
+
+[targets.sample7_unittest]
+type = "executable"
+sources = ["googletest/samples/sample7_unittest.cc"]
+cxx-std = 17
+dependencies = ["gtest_main"]
+
+[targets.sample8_unittest]
+type = "executable"
+sources = ["googletest/samples/sample8_unittest.cc"]
+cxx-std = 17
+dependencies = ["gtest_main"]
+
+[targets.sample9_unittest]
+type = "executable"
+sources = ["googletest/samples/sample9_unittest.cc"]
+cxx-std = 17
+dependencies = ["gtest"]
+
+[targets.sample10_unittest]
+type = "executable"
+sources = ["googletest/samples/sample10_unittest.cc"]
+cxx-std = 17
+dependencies = ["gtest"]

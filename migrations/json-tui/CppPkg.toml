@@ -1,0 +1,139 @@
+schema-version = 1
+
+# json-tui v1.4.2 (https://github.com/ArthurSonzogni/json-tui) migrated from
+# CMake+FetchContent to cpp-pkg. Upstream pulls ftxui, nlohmann_json, args and
+# (for tests) googletest via FetchContent; here all four are declared
+# dependencies resolved through the store.
+
+[package]
+name = "json-tui"
+version = "1.4.2"
+
+# ------------------------------------------------------------------
+# Upstream applies these per-target (PRIVATE warnings + PUBLIC
+# -fno-exceptions on json-tui-lib/json-tui only, NOT on the gtest `tests`
+# target). cpp-pkg has no per-target compile options, so they live here at
+# profile scope and hit every consumer target — including `tests`.
+# GAP(per-target-flags): see GAPS.md. This concretely broke: gtest's
+# gtest-printers.h trips -Wcharacter-conversion under C++20, and unlike
+# upstream (a) `tests` here gets -Werror (upstream shields it) and (b)
+# cpp-pkg emits dependency includes as -I where CMake would use -isystem
+# for imported targets, so the dep header's warning becomes an error.
+# Workaround: demote exactly that diagnostic; everything else stays -Werror.
+[profiles.release]
+cxx-flags = [
+  "-fno-exceptions",
+  "-Wall", "-Wextra", "-pedantic", "-Werror",
+  "-Wmissing-declarations", "-Wshadow",
+  "-Wno-error=character-conversion",
+]
+
+[profiles.debug]
+cxx-flags = [
+  "-fno-exceptions",
+  "-Wall", "-Wextra", "-pedantic", "-Werror",
+  "-Wmissing-declarations", "-Wshadow",
+  "-Wno-error=character-conversion",
+]
+
+# ------------------------------------------------------------------
+[dependencies.ftxui]
+git = "https://github.com/ArthurSonzogni/ftxui"
+tag = "v7.0.0"
+# Both ftxui's and googletest's configs find_package(Threads) and import
+# Threads::Threads, so the reference is ambiguous until one package claims
+# it. Semantically it is a CMake system-module target owned by *neither* —
+# see GAPS.md (dep-provisioning). The error message's suggested fix:
+exposes-targets = ["Threads::Threads"]
+# Same pin as upstream's FetchContent_Declare(ftxui GIT_TAG v7.0.0).
+# Store manifest exports: ftxui::screen, ftxui::dom, ftxui::component, plus
+# an aggregate ftxui::ftxui (unused here; upstream links the components).
+[dependencies.ftxui.options]
+FTXUI_BUILD_EXAMPLES = "OFF"
+FTXUI_BUILD_DOCS = "OFF"
+FTXUI_BUILD_TESTS = "OFF"
+FTXUI_ENABLE_INSTALL = "ON"
+
+# Upstream fetches https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
+# GAP(dep-provisioning): cpp-pkg url deps support only .tar.gz/.tgz/.zip —
+# .tar.xz is rejected. Workaround: the GitHub tag tarball (.tar.gz) of the
+# same v3.12.0 release.
+[dependencies.nlohmann_json]
+url = "https://github.com/nlohmann/json/archive/refs/tags/v3.12.0.tar.gz"
+sha256 = "4b92eb0c06d10683f7447ce9406cb97cd4b453be18d7279320f7b2f025c10187"
+options = { JSON_BuildTests = "OFF", JSON_Install = "ON" }
+
+# Upstream pin: FetchContent_Declare(args GIT_TAG 114200a9...). Exports
+# taywee::args (verified in the store manifest).
+# GAP(dep-provisioning): declaring this as git+rev is refused — "uses git
+# submodules" — but the commit's .gitmodules is 0 bytes and it contains no
+# gitlink entries (`git ls-tree -r` shows no 160000 mode). The submodule
+# guard false-positives on the mere presence of an empty .gitmodules.
+# Workaround: the commit tarball via url+sha256.
+[dependencies.args]
+url = "https://github.com/Taywee/args/archive/114200a9ad5fe06c8dea76e15d92325695cf3e34.tar.gz"
+sha256 = "c97c70a1451873688a62d96ed42a2dcf14bb695072fe6ab9bade3e4b57c50dfd"
+options = { ARGS_BUILD_EXAMPLE = "OFF", ARGS_BUILD_UNITTESTS = "OFF" }
+
+# Test-only dependency; upstream pins this exact commit in cmake/test.cmake.
+# GAP(testing-story): cpp-pkg has no notion of test-only deps — googletest is
+# fetched/built even when only the app targets are wanted.
+# The pinned commit predates CMake 4's minimum-version floor; upstream needs
+# CMAKE_POLICY_VERSION_MINIMUM=3.5 too (passed here as an ordinary cache
+# option, which works).
+[dependencies.googletest]
+git = "https://github.com/google/googletest"
+rev = "23ef29555ef4789f555f1ba8c51b4c52975f0907"
+# The installed config is GTestConfig.cmake, so the probe's default
+# find_package(googletest) fails; `find-package` overrides it. This field
+# exists in the implementation but is missing from CPPKG_TOML.md
+# (GAP: schema-ergonomics, docs).
+find-package = "GTest"
+[dependencies.googletest.options]
+BUILD_GMOCK = "OFF"
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+
+# ------------------------------------------------------------------
+# Targets. Upstream: add_library(json-tui-lib ...) + add_executable(json-tui)
+# + add_executable(tests). version.hpp is configure_file-generated from
+# src/version.hpp.in; pin.sh pre-generates it into gen/src/ (GAP:
+# codegen-escape-hatch).
+
+[targets.json-tui-lib]
+type = "static-library"
+sources = [
+  "src/button.cpp",
+  "src/expander.cpp",
+  "src/main_ui.cpp",
+  "src/keybinding.cpp",
+  "src/mytoggle.cpp",
+]
+cxx-std = 17
+includes = { private = ["src", "gen/src"] }
+# Upstream: add_definitions(-DJSON_NOEXCEPTION) — directory-scoped, hits all
+# three targets; a public define on the lib reaches its consumers the same way.
+defines = { public = ["JSON_NOEXCEPTION"] }
+dependencies = { private = [
+  "ftxui::screen",
+  "ftxui::dom",
+  "ftxui::component",
+], public = [
+  "nlohmann_json::nlohmann_json",
+] }
+
+[targets.json-tui]
+type = "executable"
+sources = ["src/main.cpp"]
+cxx-std = 17
+includes = { private = ["src", "gen/src"] }
+dependencies = ["json-tui-lib", "taywee::args"]
+
+# Upstream builds this only when -DJSON_TUI_BUILD_TESTS=ON.
+# GAP(conditional-sources / testing-story): no option system and no test
+# target kind — `tests` is an always-on plain executable here, run by hand.
+[targets.tests]
+type = "executable"
+sources = ["src/expander_test.cpp"]
+cxx-std = 20
+includes = { private = ["src"] }
+dependencies = ["json-tui-lib", "GTest::gtest_main"]

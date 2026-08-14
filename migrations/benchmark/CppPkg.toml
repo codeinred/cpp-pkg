@@ -1,0 +1,140 @@
+# cpp-pkg migration of google/benchmark v1.9.5 (build-from-source mode).
+# This file is copied to the root of the upstream checkout by pin.sh.
+#
+# Replicates the upstream CMake build for the macOS/arm64/AppleClang
+# configuration that the reference CMake configure produced (see
+# migrations/benchmark/README.md for the parity protocol). Everything the
+# upstream computes at configure time is hardcoded here; each hardcoding is
+# a gap documented in GAPS.md.
+
+schema-version = 1
+
+[package]
+name = "benchmark"
+version = "1.9.5"
+
+# Upstream puts its warning battery in CMAKE_CXX_FLAGS (directory-global),
+# plus CMAKE_CXX_VISIBILITY_PRESET=hidden / VISIBILITY_INLINES_HIDDEN=ON.
+# cpp-pkg has no per-target or profile-independent flag list, so the same
+# flags are duplicated into every profile we use (GAPS: per-target-flags).
+# Flag set = what add_cxx_compiler_flag() accepted on AppleClang 21 with
+# BENCHMARK_ENABLE_TESTING=OFF (verified against the reference build.ninja):
+[profiles.release]
+cxx-flags = [
+  "-Wall", "-Wextra", "-Wshadow", "-Wfloat-equal", "-Wold-style-cast",
+  "-Wconversion", "-Wformat=2", "-Werror", "-Wsuggest-override",
+  "-pedantic", "-pedantic-errors", "-Wshorten-64-to-32",
+  "-fstrict-aliasing", "-Wno-deprecated-declarations", "-Wno-deprecated",
+  "-Wstrict-aliasing", "-Wthread-safety",
+  "-fvisibility=hidden", "-fvisibility-inlines-hidden",
+  # Deviation: upstream scopes warning tweaks to the test/ directory
+  # (add_cxx_compiler_flag(-Wno-unused-variable) at directory scope); cpp-pkg
+  # flags are profile-global, so the suppression basic_test.cc needs under
+  # AppleClang 21 lands on every target (GAPS: per-target-flags). Suppression
+  # only - object code unchanged.
+  "-Wno-unused-but-set-variable",
+]
+
+[profiles.debug]
+cxx-flags = [
+  "-Wall", "-Wextra", "-Wshadow", "-Wfloat-equal", "-Wold-style-cast",
+  "-Wconversion", "-Wformat=2", "-Werror", "-Wsuggest-override",
+  "-pedantic", "-pedantic-errors", "-Wshorten-64-to-32",
+  "-fstrict-aliasing", "-Wno-deprecated-declarations", "-Wno-deprecated",
+  "-Wstrict-aliasing", "-Wthread-safety",
+  "-fvisibility=hidden", "-fvisibility-inlines-hidden",
+  # Deviation: upstream scopes warning tweaks to the test/ directory
+  # (add_cxx_compiler_flag(-Wno-unused-variable) at directory scope); cpp-pkg
+  # flags are profile-global, so the suppression basic_test.cc needs under
+  # AppleClang 21 lands on every target (GAPS: per-target-flags). Suppression
+  # only - object code unchanged.
+  "-Wno-unused-but-set-variable",
+]
+
+# ---------------------------------------------------------------------------
+# The benchmark library.
+#
+# Sources: upstream globs src/*.cc then removes benchmark_main.cc. cpp-pkg
+# globs have no exclusion syntax, so the list is spelled out (GAPS:
+# conditional-sources).
+[targets.benchmark]
+type = "static-library"
+cxx-std = 17
+sources = [
+  "src/benchmark.cc",
+  "src/benchmark_api_internal.cc",
+  "src/benchmark_name.cc",
+  "src/benchmark_register.cc",
+  "src/benchmark_runner.cc",
+  "src/check.cc",
+  "src/colorprint.cc",
+  "src/commandlineflags.cc",
+  "src/complexity.cc",
+  "src/console_reporter.cc",
+  "src/counter.cc",
+  "src/csv_reporter.cc",
+  "src/json_reporter.cc",
+  "src/perf_counters.cc",
+  "src/reporter.cc",
+  "src/statistics.cc",
+  "src/string_util.cc",
+  "src/sysinfo.cc",
+  "src/timers.cc",
+]
+includes = { public = ["include"], private = ["src"] }
+
+[targets.benchmark.defines]
+# BENCHMARK_STATIC_DEFINE is PUBLIC upstream when BUILD_SHARED_LIBS is off.
+public = ["BENCHMARK_STATIC_DEFINE"]
+# Private bucket bakes in what upstream computes at configure time:
+#  - HAVE_* feature probes (cxx_feature_check try_run; results below are the
+#    macOS/arm64/AppleClang outcomes: STD_REGEX/STEADY_CLOCK/
+#    THREAD_SAFETY_ATTRIBUTES pass, PTHREAD_AFFINITY and lib rt fail)
+#    (GAPS: codegen-escape-hatch)
+#  - _FILE_OFFSET_BITS/_LARGEFILE* large-file defines (non-MSVC branch)
+#  - BENCHMARK_VERSION, upstream = `git describe --tags ...` at configure
+#    time; hardcoded to the pinned tag (GAPS: codegen-escape-hatch). Upstream
+#    scopes it to benchmark.cc only via a per-SOURCE property; cpp-pkg has no
+#    per-source defines, target-private is the closest equivalent (GAPS:
+#    per-target-flags). Only benchmark.cc consumes it (#ifdef), so object
+#    code is identical.
+private = [
+  "HAVE_STD_REGEX",
+  "HAVE_STEADY_CLOCK",
+  "HAVE_THREAD_SAFETY_ATTRIBUTES",
+  "_FILE_OFFSET_BITS=64",
+  "_LARGEFILE64_SOURCE",
+  "_LARGEFILE_SOURCE",
+  'BENCHMARK_VERSION="v1.9.5"',
+]
+
+# Upstream also links Threads::Threads PRIVATE; on macOS pthreads live in
+# libSystem, the reference ninja passes no -pthread or -lpthread, so there is
+# nothing to declare (GAPS: dep-provisioning — no way to say "system threads"
+# portably).
+
+# ---------------------------------------------------------------------------
+# benchmark_main: one TU providing main(), PUBLIC dep on benchmark.
+[targets.benchmark_main]
+type = "static-library"
+cxx-std = 17
+sources = ["src/benchmark_main.cc"]
+defines = { private = [
+  "_FILE_OFFSET_BITS=64", "_LARGEFILE64_SOURCE", "_LARGEFILE_SOURCE",
+] }
+dependencies = { public = ["benchmark"] }
+
+# ---------------------------------------------------------------------------
+# Proof executable: upstream's own basic_test.cc (self-contained, ends in
+# BENCHMARK_MAIN(); no gtest). Upstream builds it via the test suite; here it
+# doubles as the smoke benchmark. The real test suite is NOT migrated: it
+# needs googletest as a test-only dependency plus per-test compile options
+# (GAPS: testing-story).
+[targets.basic-bench]
+type = "executable"
+cxx-std = 17
+sources = ["test/basic_test.cc"]
+defines = { private = [
+  "_FILE_OFFSET_BITS=64", "_LARGEFILE64_SOURCE", "_LARGEFILE_SOURCE",
+] }
+dependencies = ["benchmark_main"]

@@ -1,0 +1,101 @@
+# cpp-pkg port of cppcheck 2.21.1 — CLI binary only (GUI/Qt out of scope).
+#
+# Target mapping vs upstream CMake:
+#   tinyxml2 (static)        -> [targets.tinyxml2]        (vendored, compiled in-tree)
+#   simplecpp (static)       -> [targets.simplecpp]       (vendored, compiled in-tree)
+#   picojson (INTERFACE)     -> no interface-library kind in v0; folded into
+#                               consumers' private include dirs
+#   cppcheck-core (OBJECT)   -> [targets.cppcheck-core] as static-library.
+#                               Upstream's OBJECT-library comment ("auto-
+#                               registration doesn't work with static
+#                               libraries") is STALE in 2.21.x: lib/checks.cpp
+#                               registers every check explicitly, so a static
+#                               archive is correct (verified: --errorlist is
+#                               byte-identical to the CMake build, 342 ids).
+#   frontend (static)        -> [targets.frontend]
+#   cli (static) + cppcheck  -> merged into [targets.cppcheck]: upstream
+#     (exe = main.cpp)          builds the cli lib from GLOB *.cpp minus
+#                               main.cpp (list(REMOVE_ITEM)); cpp-pkg globs
+#                               have no exclude form, so cli sources + main
+#                               are compiled straight into the executable.
+#
+# Fidelity notes (deliberate, behavior-neutral divergences from the default
+# upstream Release build on this machine — see GAPS.md):
+#   - matchcompiler codegen OFF (== -DUSE_MATCHCOMPILER=Off): upstream
+#     non-Debug builds rewrite each lib/*.cpp via tools/matchcompiler.py
+#     (Token::Match -> generated matchers). Pure optimization, verified
+#     behavior-identical. cpp-pkg has no codegen hook.
+#   - no HAVE_BOOST (== -DUSE_BOOST=Off): upstream auto-detects ambient
+#     Boost and swaps std::vector for boost::container::small_vector.
+#     Performance-only.
+#   - upstream's warning setup (-Weverything + per-target -Wno-*) is not
+#     replicated; no per-target flags in v0.
+#   - precompiled headers (target_precompile_headers) not replicated.
+#
+# Runtime data: cppcheck loads cfg/*.cfg and platforms/*.xml relative to the
+# executable (or FILESDIR). Run stage-data.sh after building to copy them
+# next to build/cppcheck, mirroring upstream's copy_cfg/copy_platforms
+# post-build steps.
+
+schema-version = 1
+
+[package]
+name = "cppcheck"
+version = "2.21.1"
+
+# Upstream overrides CMake's Release -O3 with -O2 (compileroptions.cmake).
+[profiles.release]
+cxx-flags = ["-O2"]
+
+# Global defines replicated from cmake/compilerDefinitions.cmake +
+# includechecks.cmake for a Release/AppleClang/macOS build (upstream uses
+# add_definitions(), i.e. every target gets them, externals included):
+#   _GLIBCXX_DEBUG                       (Release else-branch; no-op on libc++)
+#   _LIBCPP_REMOVE_TRANSITIVE_INCLUDES
+#   HAVE_EXECINFO_H=1                    (check_include_file_cxx result)
+#   FILESDIR="/usr/local/share/Cppcheck" (default ${prefix}/share/${PROJECT_NAME})
+# cpp-pkg has no project-wide [defines], so they are repeated per target.
+
+[targets.tinyxml2]
+type = "static-library"
+sources = ["externals/tinyxml2/*.cpp"]
+cxx-std = 11
+includes = { public = ["externals/tinyxml2"] }
+defines = { private = ["_GLIBCXX_DEBUG", "_LIBCPP_REMOVE_TRANSITIVE_INCLUDES", "HAVE_EXECINFO_H=1", 'FILESDIR="/usr/local/share/Cppcheck"'] }
+
+[targets.simplecpp]
+type = "static-library"
+sources = ["externals/simplecpp/*.cpp"]
+cxx-std = 11
+includes = { public = ["externals/simplecpp"] }
+defines = { private = ["_GLIBCXX_DEBUG", "_LIBCPP_REMOVE_TRANSITIVE_INCLUDES", "HAVE_EXECINFO_H=1", 'FILESDIR="/usr/local/share/Cppcheck"'] }
+
+# Upstream: add_library(cppcheck-core OBJECT ...); PUBLIC include ".";
+# PRIVATE links tinyxml2 simplecpp picojson. Private static-lib deps
+# propagate as link-only in cpp-pkg (matches CMake $<LINK_ONLY:...>).
+[targets.cppcheck-core]
+type = "static-library"
+sources = ["lib/*.cpp"]
+cxx-std = 11
+includes = { public = ["lib"], private = ["externals/picojson"] }
+defines = { private = ["_GLIBCXX_DEBUG", "_LIBCPP_REMOVE_TRANSITIVE_INCLUDES", "HAVE_EXECINFO_H=1", 'FILESDIR="/usr/local/share/Cppcheck"'] }
+dependencies = { private = ["tinyxml2", "simplecpp"] }
+
+# Upstream: add_library(frontend ...); PUBLIC include "."; PRIVATE cppcheck-core.
+[targets.frontend]
+type = "static-library"
+sources = ["frontend/*.cpp"]
+cxx-std = 11
+includes = { public = ["frontend"] }
+defines = { private = ["_GLIBCXX_DEBUG", "_LIBCPP_REMOVE_TRANSITIVE_INCLUDES", "HAVE_EXECINFO_H=1", 'FILESDIR="/usr/local/share/Cppcheck"'] }
+dependencies = { private = ["cppcheck-core"] }
+
+# Upstream cli lib (GLOB *.cpp minus main.cpp) + cppcheck exe (main.cpp),
+# merged: no glob-exclude in cpp-pkg. cli links picojson for lib/json.h.
+[targets.cppcheck]
+type = "executable"
+sources = ["cli/*.cpp"]
+cxx-std = 11
+includes = { private = ["cli", "externals/picojson"] }
+defines = { private = ["_GLIBCXX_DEBUG", "_LIBCPP_REMOVE_TRANSITIVE_INCLUDES", "HAVE_EXECINFO_H=1", 'FILESDIR="/usr/local/share/Cppcheck"'] }
+dependencies = ["cppcheck-core", "frontend", "tinyxml2", "simplecpp"]

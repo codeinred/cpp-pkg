@@ -1,0 +1,36 @@
+Dependency patch (NOT a vtz source patch) — applied by pin.sh to a LOCAL
+CLONE of abseil-cpp 20260107.1, because cpp-pkg has no mechanism to patch a
+dependency (gap: dep-provisioning).
+
+Why: abseil 20260107.1's install export is broken for find_package
+consumers: `heterogeneous_lookup_testing` (absl/container/CMakeLists.txt)
+is missing the TESTONLY marker, so it is created and installed into
+abslTargets.cmake unconditionally, while its link interface references
+`absl::test_instance_tracker` (internal testonly — never installed) and
+`GTest::gmock` (external). Loading the installed abslConfig.cmake then
+fails with "the target was not found". Upstream vtz never sees this
+because CPM consumes absl via add_subdirectory; cpp-pkg's
+install-then-probe pipeline consumes the installed Config and does.
+
+Fixed on abseil master (TESTONLY added) after the 20260107.1 release; this
+is a backport of exactly that one-line fix.
+
+pin.sh applies this to a clone of abseil-cpp @ 20260107.1
+(255c84dadd029fd8ad25c5efb5933e47beaa00c7), commits with pinned
+author/committer identity + date (deterministic commit sha
+4645a01a5cee98f8a95b83b0b7c8acd5a3ed93a1), and rewrites the
+@ABSL_PATCHED_REPO@ placeholder in the staged CppPkg.toml to the local
+file:// URL of that clone.
+
+diff --git a/absl/container/CMakeLists.txt b/absl/container/CMakeLists.txt
+index 365c6ea3..d12e585e 100644
+--- a/absl/container/CMakeLists.txt
++++ b/absl/container/CMakeLists.txt
+@@ -1119,6 +1119,7 @@ absl_cc_library(
+     absl::config
+     absl::test_instance_tracker
+     GTest::gmock
++  TESTONLY
+ )
+
+ absl_cc_library(

@@ -1,0 +1,251 @@
+schema-version = 1
+
+# Migration of https://github.com/voladynamics/vtz (IANA-timezone library)
+# pinned at main commit 8d6ea8f35ed18fb72b9796a1d9a843df0529baf0.
+#
+# Upstream is CMake 3.23 (FILE_SET installs, OBJECT library vtz_objects
+# feeding both `vtz` and `vtz_impl`, ALIAS targets, configure-time
+# file(DOWNLOAD) of the IANA tzdb). See README.md / GAPS.md next to this
+# file for the mapping and the friction points.
+
+[package]
+name = "vtz"
+version = "1.1.0"
+
+# ------------------------------------------------------------------
+# Upstream applies these globally via add_compile_options() at top level
+# (dev warnings) plus CMAKE_CXX_VISIBILITY_PRESET hidden /
+# CMAKE_VISIBILITY_INLINES_HIDDEN ON. cpp-pkg has no profile-independent
+# project-wide flag list, so the same list is repeated for the two profiles
+# we actually use (gap: schema-ergonomics / per-target-flags).
+# CMAKE_POSITION_INDEPENDENT_CODE ON is dropped: on macOS arm64 all code is
+# PIC and we only build the static `vtz` flavor (VTZ_BUILD_SHARED=OFF).
+[profiles.release]
+cxx-flags = [
+  "-fdiagnostics-color=always",
+  "-Werror=uninitialized",
+  "-Wunused",
+  "-Wimplicit-fallthrough",
+  "-Wnarrowing",
+  "-Wunused-parameter",
+  "-Wshorten-64-to-32",        # clang-only upstream; no toolchain conditionals in v0
+  "-fvisibility=hidden",
+  "-fvisibility-inlines-hidden",
+]
+
+[profiles.debug]
+cxx-flags = [
+  "-fdiagnostics-color=always",
+  "-Werror=uninitialized",
+  "-Wunused",
+  "-Wimplicit-fallthrough",
+  "-Wnarrowing",
+  "-Wunused-parameter",
+  "-Wshorten-64-to-32",
+  "-fvisibility=hidden",
+  "-fvisibility-inlines-hidden",
+]
+
+# ------------------------------------------------------------------
+# Dependencies. Upstream vendors ankerl inline (etc/3rd/ankerl) and creates
+# an INTERFACE lib + ALIAS unordered_dense::unordered_dense; per the
+# migration brief we declare the real upstream package instead, pinned to
+# the same version as the vendored header (4.8.1).
+[dependencies]
+fmt = { git = "https://github.com/fmtlib/fmt", tag = "11.2.0" }
+unordered_dense = { git = "https://github.com/martinus/unordered_dense", tag = "v4.8.1" }
+
+# Test-only deps (no way to mark them test-only in v0 — they resolve/build
+# for every consumer of this manifest; gap: testing-story).
+#
+# NOTE: the dependency key is also the find_package() name used by the
+# probe, so it MUST be "GTest" (GTestConfig.cmake), not "googletest" —
+# there is no separate `cmake-package` field (gap: schema-ergonomics).
+[dependencies.GTest]
+git = "https://github.com/google/googletest"
+tag = "v1.17.0"
+
+# Hinnant date is the reference implementation the tests compare against.
+# MANUAL_TZ_DB=ON: no curl / no auto-download; tests point it at the same
+# extracted tzdata dir vtz uses (upstream passes the same options via CPM).
+# NOT the upstream URL: date v3.0.4 exports headers via INTERFACE_SOURCES
+# ("helps IDEs"); cpp-pkg tries to compile them and errors on `.h`. pin.sh
+# stages a local clone with the exports removed (see
+# patches/deps-date-0001-*.patch; cpp-pkg extraction bug + no dep-patch
+# mechanism).
+[dependencies.date]
+git = "@DATE_PATCHED_REPO@"
+rev = "a165a37035b2471ce969a025296e543975b5bdb1"
+options = { BUILD_TZ_LIB = "ON", MANUAL_TZ_DB = "ON" }
+# Threads::Threads is the CMake-builtin Threads pseudo-package, re-created
+# by find_dependency(Threads) in FOUR dep configs (GTest, absl, benchmark,
+# date) → ambiguous reference. cpp-pkg makes us pick an arbitrary "owner";
+# date is the one whose component actually surfaces the reference (gap:
+# schema-ergonomics / dep-provisioning — builtin module packages need a
+# real story, not per-package ownership claims).
+exposes-targets = ["Threads::Threads"]
+
+# Bench-only deps.
+[dependencies.benchmark]
+git = "https://github.com/google/benchmark"
+tag = "v1.9.4"
+options = { BENCHMARK_ENABLE_TESTING = "OFF", BENCHMARK_ENABLE_GTEST_TESTS = "OFF" }
+
+# Key must be "absl" (abslConfig.cmake), same find_package-name issue as
+# GTest above.
+#
+# NOT the upstream URL: abseil 20260107.1's install export is broken for
+# find_package consumers (heterogeneous_lookup_testing lacks TESTONLY;
+# fixed on absl master). cpp-pkg cannot patch a dependency, so pin.sh
+# stages a local clone of abseil-cpp @ 255c84da (= 20260107.1) with the
+# one-line backport applied as a deterministic commit, and substitutes
+# the placeholder below with that clone's file:// URL. See
+# patches/deps-absl-0001-*.patch (gap: dep-provisioning).
+[dependencies.absl]
+git = "@ABSL_PATCHED_REPO@"
+rev = "4645a01a5cee98f8a95b83b0b7c8acd5a3ed93a1"
+# Upstream builds absl in C++20 mode (ABSL_INTERNAL_AT_LEAST_CXX20 ON via
+# CPM); the supported spelling for an install build is CMAKE_CXX_STANDARD.
+options = { ABSL_ENABLE_INSTALL = "ON", ABSL_PROPAGATE_CXX_STD = "ON", CMAKE_CXX_STANDARD = "20" }
+
+# ------------------------------------------------------------------
+# Library targets.
+#
+# Upstream compiles include/api/*.cpp + include/impl/*.cpp ONCE into an
+# OBJECT library (vtz_objects) and wraps it twice: `vtz` (public headers =
+# include/api only) and `vtz_impl` (internals exposed for tests/bench).
+# cpp-pkg has no object-library kind, so the same sources are compiled
+# twice (gap: object-libraries).
+#
+# Per-source property upstream: embedded_tzdb.cpp gets
+# COMPILE_DEFINITIONS VTZ_EMBED_TZDB=$<BOOL:...>. No per-source defines in
+# cpp-pkg; VTZ_EMBED_TZDB=1 is set target-wide instead — safe because only
+# embedded_tzdb.cpp tests the macro (gap: per-target-flags).
+[targets.vtz]
+type = "static-library"
+sources = ["include/api/**/*.cpp", "include/impl/**/*.cpp"]
+cxx-std = 17
+includes = { public = ["include/api"], private = ["include/impl"] }
+defines = { public = ["VTZ_STATIC_DEFINE"], private = [
+  'VTZ_TZDATA_PATH_VARS="VTZ_TZDATA_PATH"',
+  "vtz_EXPORTS",
+  "VTZ_EMBED_TZDB=1",
+] }
+dependencies = { private = ["unordered_dense::unordered_dense"] }
+
+[targets.vtz_impl]
+type = "static-library"
+sources = ["include/api/**/*.cpp", "include/impl/**/*.cpp"]
+cxx-std = 17
+includes = { public = ["include/impl", "include/api"] }
+defines = { public = ["VTZ_STATIC_DEFINE"], private = [
+  'VTZ_TZDATA_PATH_VARS="VTZ_TZDATA_PATH"',
+  "vtz_EXPORTS",
+  "VTZ_EMBED_TZDB=1",
+] }
+dependencies = { public = ["unordered_dense::unordered_dense"] }
+
+[targets.vtz_extras]
+type = "static-library"
+sources = ["include/extras/**/*.cpp"]
+cxx-std = 17
+includes = { public = ["include/extras"] }
+dependencies = { public = ["fmt::fmt", "vtz_impl"] }
+
+# ------------------------------------------------------------------
+# Tests (upstream: etc/test, gtest_discover_tests + add_standalone_test;
+# cpp-pkg has no test runner — see README for the manual invocations).
+[targets.vtz_testing]
+type = "static-library"
+sources = ["etc/test/include/test_vtz/*.cpp"]
+cxx-std = 17
+includes = { public = ["etc/test/include"], private = ["include/api", "include/impl"] }
+dependencies = { public = [
+  "date::date",
+  "date::date-tz",
+  "GTest::gtest",
+  "GTest::gmock",
+  "fmt::fmt",
+] }
+
+[targets.test_vtz]
+type = "executable"
+sources = ["etc/test/test_impl/*.cpp"]
+cxx-std = 17
+dependencies = ["vtz_testing", "vtz_extras"]
+
+[targets.test_vtz_api]
+type = "executable"
+sources = ["etc/test/test_api/*.cpp"]
+cxx-std = 17
+dependencies = ["vtz_testing", "vtz"]
+
+[targets.test_tzdb_load]
+type = "executable"
+sources = ["etc/test/standalone/test_tzdb_load.cpp"]
+cxx-std = 17
+dependencies = ["vtz"]
+
+# ------------------------------------------------------------------
+# Examples. Upstream generates one exe per file with a foreach-glob; no
+# target-templating in cpp-pkg, so each is spelled out (gap:
+# schema-ergonomics).
+[targets.vtz_tldr]
+type = "executable"
+sources = ["examples/src/vtz_tldr.cpp"]
+cxx-std = 17
+dependencies = ["vtz", "fmt::fmt"]
+
+[targets.vtz_chrono]
+type = "executable"
+sources = ["examples/src/vtz_chrono.cpp"]
+cxx-std = 17
+dependencies = ["vtz", "fmt::fmt"]
+
+[targets.vtz_unix_time]
+type = "executable"
+sources = ["examples/src/vtz_unix_time.cpp"]
+cxx-std = 17
+dependencies = ["vtz", "fmt::fmt"]
+
+[targets.vtz_a_guided_tour]
+type = "executable"
+sources = ["examples/src/vtz_a_guided_tour.cpp"]
+cxx-std = 20
+dependencies = ["vtz", "fmt::fmt"]
+
+# Tool (upstream: etc/tools foreach-glob).
+[targets.dump_tzfile]
+type = "executable"
+sources = ["etc/tools/dump_tzfile.cpp"]
+cxx-std = 17
+dependencies = ["vtz_extras", "fmt::fmt"]
+
+# ------------------------------------------------------------------
+# Bench. Upstream globs etc/bench/src/*.cpp and REMOVE_ITEMs
+# bench_date_with_os_tzdb.cpp unless VTZ_ALSO_BENCH_HINNANT_OS_TZDB (that
+# variant also needs per-source -U/-D flags and compiles
+# ${date_SOURCE_DIR}/src/tz.cpp straight out of the dependency's source
+# tree — inexpressible in cpp-pkg; we build the OFF configuration, which
+# is a supported upstream config). No glob-exclusion syntax either, so the
+# files are listed explicitly (gap: conditional-sources).
+[targets.bench_vtz]
+type = "executable"
+sources = [
+  "etc/bench/src/bench_format.cpp",
+  "etc/bench/src/bench_locate_zone.cpp",
+  "etc/bench/src/bench_main.cpp",
+  "etc/bench/src/bench_parse.cpp",
+  "etc/bench/src/bench_tz_with_lookup.cpp",
+  "etc/bench/src/bench_vtz.cpp",
+  "etc/bench/src/bench_vtz_civil.cpp",
+]
+cxx-std = 20
+dependencies = [
+  "vtz_impl",
+  "benchmark::benchmark",
+  "fmt::fmt",
+  "date::date-tz",
+  "absl::time",
+  "absl::time_zone",
+]
