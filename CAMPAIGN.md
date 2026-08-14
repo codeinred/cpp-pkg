@@ -71,3 +71,7 @@ runner-up in the Taste Memo.
   keres access verified.
 - 2026-08-14 (late): S1 COMPLETE — 8/8 green on macOS, BACKLOG.md ranked
   (12 gaps, 5 sketches). Committed + pushed. S2 design round launched.
+- 2026-08-14 03:10: S2 COMPLETE — normative spec docs/design/
+  wave1-extensions.md (6 designers, taste judge, 16 red-team findings all
+  adjudicated, 8 taste-memo entries, 8 expensive-to-reverse flags).
+  S3 implementation wave launching.
