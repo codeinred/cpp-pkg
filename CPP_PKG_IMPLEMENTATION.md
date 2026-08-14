@@ -59,6 +59,9 @@ Consequences:
 - The configuration hash (see `CPP_PKG.md` store design) incorporates the
   toolchain identity: compiler path + version, target triple, stdlib, and any
   ABI-affecting global flags — not merely the package's own CMake options.
+  ABI-affecting *profile* flags also propagate into dependency builds and
+  fold into their config hashes (decided 2026-08-13; classification table in
+  `CPPKG_TOML.md`).
 - The hash also incorporates the artifact hashes of the package's resolved
   dependencies (Nix-derivation-style), so rebuilding a dep invalidates
   dependents.

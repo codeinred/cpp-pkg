@@ -105,6 +105,25 @@ into `CPPKG_TOML.md` (now normative):
   normalized to kebab-case (`exposes-namespace` vs concept doc's snake_case)
   — user may veto.
 
+## 2026-08-13 — User rulings on schema follow-ups
+
+- **Git content hash = commit sha for v0.** Supersedes the canonical
+  tree-serialization spec (kept on record only as a future fallback, e.g. if
+  git-independent store verification is ever needed). The lockfile `commit`
+  field is simultaneously pin, integrity check (`git rev-parse` after
+  checkout; hardened SHA-1 acceptable for v0), and the re-download reference
+  for fresh machines. `content-hash` now appears only on url sources.
+  Submodules-error-in-v0 unchanged.
+- **ABI-affecting profile flags fold into dependency config hashes** and
+  propagate to dependency builds (via the generated toolchain file), instead
+  of hard-erroring — the classification table needed for the denylist drives
+  correct propagation instead. Deps rebuild under such profiles by
+  construction. Non-ABI flags stay consumer-only; `-fsanitize=*` stays
+  consumer-only + warning (sanitizers interoperate with uninstrumented
+  code by design).
+- **kebab-case keys approved** for the initial schema; may flip later on
+  aesthetics.
+
 ## Open
 - Test dependency shortlist. Proposed: **fmt** (clean, simple installed lib),
   **spdlog** with `SPDLOG_FMT_EXTERNAL=ON` (real transitive

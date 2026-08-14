@@ -157,18 +157,23 @@ via extraction (INTERFACE imported targets).
 - The selected profile determines `CMAKE_BUILD_TYPE` for every dependency
   (strict same-config propagation; `DESIGN_CHOICES.md`).
 - Profile `cxx-flags`/`c-flags`/`link-flags` apply to **consumer targets
-  only**, never to dependency builds. v0 rationale: scope and store-churn
-  control (NOT "hash meaningfulness" — folding flags into the dep config hash
-  would also be sound, at the cost of more store entries; that is the
-  intended future evolution, gated on explicit opt-in, e.g. custom profiles
-  with `base-config` or an `apply-to-dependencies` flag, and any flag
-  reaching a dep build MUST fold into that dep's config hash).
-- Guardrails, since consumer-only flags against static deps can lie: known
-  **ABI-affecting flags/defines are a hard error** in `[profiles.*]`
+  only** — *except* the ABI-affecting class below, which reaches dependency
+  builds. General (non-ABI) flags reaching deps remains future work, gated on
+  explicit opt-in (custom profiles with `base-config` or an
+  `apply-to-dependencies` flag); the invariant, already honored by the ABI
+  class: any flag reaching a dep build MUST fold into that dep's config
+  hash.
+- **ABI-affecting flags propagate to dependency builds** (decided
+  2026-08-13): a classification table recognizes ABI-affecting flags/defines
   (`-D_GLIBCXX_DEBUG`, `-D_GLIBCXX_ASSERTIONS`, `-D_GLIBCXX_USE_CXX11_ABI=*`,
-  `-D_LIBCPP_HARDENING_MODE=*`, `-stdlib=*`, `-f*-abi*` — table extensible);
-  `-fsanitize=*` is a **warning** explaining dependencies are uninstrumented
-  (ASan tolerates this and remains useful; MSan/TSan-style whole-world
+  `-D_LIBCPP_HARDENING_MODE=*`, `-stdlib=*`, `-f*-abi*` — extensible), and
+  these are injected into every dependency's build (via the generated
+  toolchain file) and **folded into each dependency's config hash**, so deps
+  rebuild under such profiles — correct by construction rather than
+  hard-erroring. Unrecognized flags default to consumer-only.
+  `-fsanitize=*` remains consumer-only with a **warning** that dependencies
+  are uninstrumented (sanitizers are designed to interoperate with
+  uninstrumented code — ASan stays useful; MSan/TSan-style whole-world
   instrumentation is out of scope).
 - Flags route by language: `cxx-flags` only to the C++ driver, `c-flags`
   only to the C driver.
@@ -203,8 +208,7 @@ schema-version = 1
 name = "fmt"
 source = "git+https://github.com/fmtlib/fmt"
 requested = "tag:11.2.0"
-commit = "<resolved sha>"
-content-hash = "blake3:<canonical hash — see below>"
+commit = "<resolved sha>"           # pin + integrity + re-download reference
 
 [[package]]
 name = "zlib"
@@ -215,20 +219,25 @@ content-hash = "blake3:<hash of the archive bytes as downloaded>"
 
 Grammar is lockfile ABI, pinned here (not left to what the implementation
 happens to print): `source` = `git+<url>` | `url+<url>`; `requested` =
-`tag:<tag>` | `rev:<sha>` | `sha256:<hex>`; `commit` present iff git.
+`tag:<tag>` | `rev:<sha>` | `sha256:<hex>`; `commit` present iff git;
+`content-hash` present iff url.
 
-**`content-hash` canonicalization** (the most cornering item in the design —
-fixed before any lockfile ships, because changing it invalidates every
-lockfile in existence):
+**Integrity model (decided 2026-08-13):**
 
-- `url` sources: blake3 of the archive bytes exactly as downloaded.
-- `git` sources: blake3 of a **canonical tree serialization**: repo-relative
-  paths walked in sorted byte order; each entry contributes
-  `(path, kind, exec-bit, content)` where kind ∈ {file, symlink (content =
-  target string), dir (implicit via paths)}; permissions normalized to the
-  exec bit only; mtimes excluded; `.git` excluded. Submodules: error in v0
-  (a commit pin does not pin submodules; building silently without them is a
-  classic package-manager bug — refuse instead).
+- `git` sources: the **commit sha is the content hash** — git commits are
+  already content-addressed (tree + history), verification is
+  `git rev-parse HEAD` after checkout, and the same sha serves re-download on
+  a fresh machine (clone/fetch that commit from `source`). No custom tree
+  serialization to specify or maintain; git's hardened SHA-1 is an acceptable
+  v0 threat model. (A CppPkg-defined canonical tree hash remains the recorded
+  fallback if store-level verification independent of git is ever needed —
+  e.g. tarball exports of git sources — but v0 does not define one.)
+- `url` sources: blake3 of the archive bytes exactly as downloaded (plus the
+  user-declared `sha256` checked at fetch time).
+- Submodules remain an **error in v0**: gitlinks do pin exact submodule
+  commits, but naive clones don't fetch them and `.gitmodules` URLs are
+  mutable — building silently without them is a classic package-manager bug;
+  refuse instead.
 
 Written/updated on every resolve; committed to the consumer's VCS.
 `options`/`needs` are deliberately absent (they live in `CppPkg.toml` and the
