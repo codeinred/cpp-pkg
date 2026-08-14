@@ -124,6 +124,28 @@ into `CPPKG_TOML.md` (now normative):
 - **kebab-case keys approved** for the initial schema; may flip later on
   aesthetics.
 
+## 2026-08-13 — Implementation kickoff choices (Claude)
+
+- **Crate layout:** single crate, bin `cpp-pkg` + lib `cppkg`, edition 2021;
+  module contracts frozen in stubs (src/*.rs doc comments are normative for
+  implementers). Deps pre-declared in Cargo.toml; agents may not edit it.
+- **Probe wire format:** record-oriented text (\x1E record sep, \x1F field
+  sep), NOT JSON — CMake cannot safely JSON-escape arbitrary property
+  values; `;`-list splitting happens in Rust. `$<LINK_ONLY>` preserved via a
+  parallel raw (unevaluated) INTERFACE_LINK_LIBRARIES record.
+- **Schema addition:** optional dependency field `find-package` (probe's
+  find_package name when it differs from the dep key, e.g. key `json` →
+  `nlohmann_json`). Defaults to the dep key. (User may veto.)
+- **Store entry crash-safety:** `.cppkg-entry.toml` marker with
+  `complete = true` written last; incomplete entries treated as absent.
+- **CMake 4.x host note:** dep configures pass
+  `CMAKE_POLICY_VERSION_MINIMUM=3.5` (CMake 4.4 dropped <3.5 compat and many
+  real deps still declare old minimums).
+- **Provider mechanism detail:** provider script shells out to an internal
+  `cpp-pkg provide` subcommand and find_package's the emitted shim
+  (NO_DEFAULT_PATH); FIND_PACKAGE method only in v0 (FetchContent deferred).
+- **`--path/--with` prototyping flow deferred post-v0.**
+
 ## Open
 - Test dependency shortlist. Proposed: **fmt** (clean, simple installed lib),
   **spdlog** with `SPDLOG_FMT_EXTERNAL=ON` (real transitive
