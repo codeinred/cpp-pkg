@@ -79,3 +79,30 @@ runner-up in the Taste Memo.
   interruption recovered via workflow cache). 395 tests, hash discipline
   proven (byte-identical lockfiles, warm-store hits). Spec amendments
   ratified. S4 re-migration launching.
+- 2026-08-14 (mid-morning): WEEKLY SESSION LIMIT — wound down mid-S4.
+  5/8 re-migrations landed (green: googletest, cpptrace, benchmark;
+  partial: json-tui, ninja). Remaining: vtz, cppcheck, abseil + verdict.
+  All work committed + pushed. See PICKUP below.
+
+## PICKUP (next session, ~2026-08-16)
+
+Everything needed is in this repo; the prior session's workflow cache and
+scratchpad stores are NOT reachable cross-session — plan accordingly.
+
+1. `cargo build` (target/ is local-only; same machine, fast).
+2. Resume S4: `Workflow({scriptPath: "/opt/claude/cpp-pkg/tools/s4-remigration.workflow.js"})`
+   — pre-adapted: runs only vtz/cppcheck/abseil re-migrations, then the
+   synthesis verdict which reads all eight `migrations/*/GAPS.md` from disk
+   (the five completed wave-2 editions are committed). Fresh stores mean
+   dependency rebuilds (~minutes per project; abseil/cppcheck are the slow
+   ones).
+3. Apply the verdict per CAMPAIGN stage rules: blockers/majors in wave-1
+   features ⇒ one more S2'-S3' loop (scoped by the verdict); otherwise
+   proceed to S5 Linux bring-up on keres (ssh claude@keres — access was
+   verified; toolchain inventory in the S5 task + CLAUDE.local.md).
+4. Known partial-findings to fold into the verdict: json-tui and ninja
+   wave-2 GAPS.md "Remaining" sections (their agents completed with
+   status=partial).
+5. Ongoing obligations: MORNING_REPORT.md is the user's in-depth review
+   surface (taste memo + expensive-to-reverse lists are current through
+   S3); commit + push every stable point; tasks #4-#7 track stages.

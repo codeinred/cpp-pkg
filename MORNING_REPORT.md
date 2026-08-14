@@ -22,6 +22,16 @@ vtz 774/774 tests incl. death tests; cppcheck byte-identical --errorlist;
 benchmark bit-identical object files. S2 (design round with taste agent)
 launched.
 
+## Status: wound down at weekly session limit (2026-08-14, mid-S4)
+
+S4 re-migration was 5/8 complete at wind-down (green: googletest, cpptrace,
+benchmark — their wave-1 workarounds dissolved into native syntax; partial:
+json-tui, ninja — remaining findings recorded in their wave-2 GAPS.md).
+vtz, cppcheck, abseil + the loop verdict resume next session via
+`tools/s4-remigration.workflow.js` (see CAMPAIGN.md PICKUP). Nothing was
+lost: every artifact is committed and pushed through commit series ending
+at the S4 WIP checkpoint.
+
 ## Executive summary — S3 (implementation) complete
 
 Wave-1 extensions are IMPLEMENTED: cfg conditionals, [flags] + per-target
