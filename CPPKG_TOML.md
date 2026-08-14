@@ -1,8 +1,9 @@
 # `CppPkg.toml` — v0 schema
 
-Status: **draft** (2026-08-13). Concrete choices recorded in
-`DESIGN_CHOICES.md`; this file is the normative schema description with an
-annotated example.
+Status: **v0, oracle-reviewed** (2026-08-13). Concrete choices and the oracle
+verdicts are recorded in `DESIGN_CHOICES.md`; this file is the normative
+schema description with an annotated example. Key convention: kebab-case for
+all TOML keys (`exposes-namespace`, `cxx-std`).
 
 ## Annotated example
 
@@ -10,57 +11,76 @@ annotated example.
 schema-version = 1                  # required; format versioning from day one
 
 [package]
-name = "myapp"                      # required; [a-zA-Z0-9_-]+
+name = "myapp"                      # required; charset [a-zA-Z0-9_-]+
 version = "0.1.0"                   # optional in v0 (no solver consumes it)
 
 # ------------------------------------------------------------------
-# Toolchain presets (optional). Selected via `cppkg build --toolchain <name>`;
-# a path argument (`--toolchain /usr/bin/clang++`) also works. With neither,
-# CppPkg auto-detects `c++` on PATH.
+# Toolchain presets (optional). Selected via `cpp-pkg build --toolchain
+# <name>`; a path argument (`--toolchain /usr/bin/clang++`) also works. With
+# neither, CppPkg auto-detects `c++` on PATH.
 [toolchains.gcc-homebrew]
 cxx = "g++-15"
 cc  = "gcc-15"                      # optional; derived from cxx if omitted
 ar  = "gcc-ar-15"                   # optional; detected if omitted
+# (target/sysroot/stdlib fields are future additive extensions; toolchain
+# *identity* always comes from detection output, never from the preset name)
 
 # ------------------------------------------------------------------
-# Per-config flag additions (optional). Configs are the CMake-compatible set:
-# debug | release | relwithdebinfo | minsizerel. Selected via
-# `cppkg build --config debug` (default: release).
+# Profiles: named build flavors. v0 ships exactly the four built-ins, named
+# after the CMake configs: debug | release | relwithdebinfo | minsizerel
+# (selected via `cpp-pkg build --config debug`; default release).
+# `base-config` is RESERVED for future custom profiles (e.g. a "debug-asan"
+# with base-config = "debug") so profile names are not forever conflated with
+# CMake config names; v0 rejects profiles outside the built-in four.
 [profiles.debug]
-cxx-flags  = ["-fsanitize=address"]
+cxx-flags  = ["-fsanitize=address"] # consumer targets only — see Semantics
+c-flags    = []                     # routed to the C driver only
 link-flags = ["-fsanitize=address"]
 
 # ------------------------------------------------------------------
 # Dependencies: the FULL transitive closure, declared by the user (v0).
-# Keys are CppPkg-local package names (used in the lockfile and store);
-# consumers reference the *targets* a package exports, not the package name.
+# Keys: charset [a-zA-Z0-9_-]+ ("::" and "/" thereby unavailable, reserving
+# qualified-reference syntax). Consumers reference the *targets* a package
+# exports, not the package key.
 [dependencies]
 fmt    = { git = "https://github.com/fmtlib/fmt", tag = "11.2.0" }
 spdlog = { git = "https://github.com/gabime/spdlog", tag = "v1.15.3",
            options = { SPDLOG_FMT_EXTERNAL = "ON" },
-           needs = ["fmt"] }        # explicit find_dependency edge (see below)
+           needs = ["fmt"] }        # find_dependency edge — see Semantics
 zlib   = { url = "https://zlib.net/zlib-1.3.1.tar.gz",
            sha256 = "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23" }
 
 # Source forms (exactly one per dependency):
-#   git + tag | git + rev (commit)     — tag is resolved to a commit and
-#                                        pinned in CppPkg.lock
-#   url + sha256                       — tarball/zip
+#   git + tag | git + rev (commit)   — tag resolved to a commit, pinned in
+#                                      CppPkg.lock; git submodules are an
+#                                      ERROR in v0 (unsupported, not ignored)
+#   url + sha256                     — tarball/zip
 # Common fields:
-#   options = { KEY = "VALUE" }        — CMake cache options for the dep build
-#   needs   = ["name", ...]            — packages this dep's config requires
-#                                        (find_dependency); drives build order
-#                                        and CMAKE_PREFIX_PATH assembly
+#   options = { KEY = "VALUE" }      — CMake cache options for the dep build.
+#                                      Hashed as LITERAL strings: ON/TRUE/1
+#                                      are distinct hash inputs by design;
+#                                      never "normalize" them (it would
+#                                      invalidate every store entry).
+#   needs   = ["depkey", ...]        — packages whose config files this dep's
+#                                      config requires (find_dependency)
+#   exposes-namespace = ["fmt"]      — claim ownership of all targets whose
+#                                      namespace is `fmt::` (when the dep key
+#                                      doesn't match the exported namespace)
+#   exposes-targets   = ["fmt::fmt"] — claim explicit targets; the mapping
+#                                      form renames: { "fmt::fmt" = "fmt" }
 
 # ------------------------------------------------------------------
-# Targets. Table key = target name (no "::" allowed, so local names can never
-# collide with dependency-exported names like "fmt::fmt").
+# Targets. Table key = target name; charset [a-zA-Z0-9_-]+ (no "::", so local
+# names can never collide with dependency-exported names like "fmt::fmt").
 [targets.core]
 type    = "static-library"
-sources = ["src/core/**/*.cpp"]     # globs allowed; resolved at generation
-                                    # time (build.ninja is regenerated every
-                                    # build in v0, so globs stay fresh)
-cxx-std = 20                        # lowered per-toolchain (e.g. -std=c++20)
+sources = ["src/core/**/*.cpp"]     # globs resolve in sorted (lexicographic
+                                    # byte-order) form at generation time;
+                                    # build.ninja regenerates every build in
+                                    # v0, so globs stay fresh
+cxx-std = 20                        # strict -std=c++20; `cxx-extensions =
+                                    # true` (gnu++20) is reserved, default
+                                    # false, decided now
 includes = { public = ["include"], private = ["src"] }
 defines  = { public = ["CORE_API="], private = ["CORE_INTERNAL"] }
 dependencies = { public = ["fmt::fmt"], private = ["spdlog::spdlog"] }
@@ -68,37 +88,111 @@ dependencies = { public = ["fmt::fmt"], private = ["spdlog::spdlog"] }
 [targets.myapp]
 type    = "executable"
 sources = ["src/main.cpp"]
-dependencies = ["core"]             # bare list == all-private (sugar)
+dependencies = ["core"]             # bare list == all-private (sugar; applies
+                                    # uniformly to includes/defines/deps)
 ```
 
 ## Semantics
 
-- **Target reference namespace.** A `dependencies` entry is either a sibling
-  target name (`core`) or a dependency-exported target name (`fmt::fmt`, as
-  extracted into the manifest). The namespaces cannot collide because local
-  target names may not contain `::`. Un-namespaced tier-3 exports will be
-  namespaced by the extractor later (`<pkg>::<target>`), preserving this rule.
-- **public/private propagation** mirrors CMake's PUBLIC/PRIVATE and exists in
-  v0 (C++ cannot do without it): `public` entries of a library's `includes`/
-  `defines`/`dependencies` propagate to its consumers; `private` do not.
-  `$<LINK_ONLY>`-style link-only edges arise from *extracted* manifests, not
-  from `CppPkg.toml` syntax, in v0. An `interface` visibility bucket
-  (header-only libraries) is deliberately deferred with `interface-library`
-  targets.
-- **`needs` on dependencies** is required in v0 whenever a dep's config file
-  calls `find_dependency`: CppPkg builds `needs` first and places them on the
-  dep's `CMAKE_PREFIX_PATH`. A `find_dependency` that fails anyway produces a
-  clear error naming the missing package and suggesting a `needs`/
-  `[dependencies]` addition. (Auto-discovery of the edge from the failed
-  configure is future work.)
-- **Configs propagate strictly**: the selected profile's config is the
-  `CMAKE_BUILD_TYPE` for every dependency; profile `cxx-flags` apply to
-  consumer targets only, never to dependency builds (deps are configured only
-  by `options` + the toolchain — keeps the store hash meaningful).
-- **Target kinds in v0**: `executable`, `static-library`. (`shared-library`,
-  `interface-library` on the TODO.)
-- **C sources** are allowed in `sources`; language selected per-file by
-  extension (`.c` → C driver flags, `c-std` field analogous to `cxx-std`).
+### Target references and the naming ladder
+
+A `dependencies` entry is either a sibling target name (`core`) or a
+dependency-exported target name (`fmt::fmt`). Resolution follows the ladder
+(per `CPP_PKG.md`):
+
+1. If the name is unique across all dependencies' manifests, it resolves
+   directly.
+2. Otherwise, a name beginning with `<depkey>::` belongs to the dependency
+   whose key is `<depkey>`.
+3. Otherwise, `exposes-namespace` / `exposes-targets` declarations decide
+   ownership (`exposes-targets` in mapping form also renames).
+4. A reference that remains ambiguous is a **hard error at resolve time** —
+   never first-wins — and the error lists every candidate owning package with
+   the `exposes-*` addition that would disambiguate.
+
+These declarations are also the user-facing override for the extractor's
+namespace-attribution heuristic (transitive `find_dependency` targets appear
+in more than one probe's output; attribution must be overridable).
+
+Entries in a `dependencies` array are **string-or-table** from v1 of the
+schema: strings are sugar, and the table form (`{ target = "...", ... }`) is
+reserved for per-edge attributes (renames, link-only) without a breaking
+change. v0 implements strings only.
+
+### Visibility and propagation
+
+`public` entries of a library's `includes`/`defines`/`dependencies` propagate
+to its consumers; `private` do not — with one crucial exception: **for a
+`static-library`, `private` dependencies propagate as link-only edges**
+(CMake's `$<LINK_ONLY:...>` behavior). A static library does not link, so its
+private deps' *artifacts* must still reach the final link closure; only their
+compile requirements stop. (`myapp → core → private spdlog`: myapp links
+spdlog but sees none of its headers/defines.) The manifest IR's separate
+compile-edge/link-edge fields carry this directly.
+
+An `interface` visibility bucket and `interface-library` target kind are
+deferred (purely additive later); header-only *dependencies* still work in v0
+via extraction (INTERFACE imported targets).
+
+### `needs` and find_dependency
+
+- Every `needs` entry must be a key of `[dependencies]`; unknown keys and
+  `needs` cycles are errors.
+- Build order follows `needs` edges. When configuring a dependency, its
+  `CMAKE_PREFIX_PATH` contains the store prefixes of the **transitive closure
+  of its `needs`** — not just direct entries — because a loaded
+  `fmtConfig.cmake` re-runs its own `find_dependency` calls in the same
+  configure.
+- `needs` edges feed the config hash (via the dep-artifact-hash rule,
+  `CPP_PKG_IMPLEMENTATION.md` §3): editing `needs` causes rebuilds, by
+  design.
+- Both failure shapes are caught and translated: `find_dependency(X)`
+  not-found → "add X to [dependencies] and to <dep>.needs"; and
+  `find_dependency(X <version>)` version-rejection (a different, more
+  confusing CMake error) → an error naming the pinned version vs. the
+  requirement.
+
+### Profiles and configs
+
+- The selected profile determines `CMAKE_BUILD_TYPE` for every dependency
+  (strict same-config propagation; `DESIGN_CHOICES.md`).
+- Profile `cxx-flags`/`c-flags`/`link-flags` apply to **consumer targets
+  only**, never to dependency builds. v0 rationale: scope and store-churn
+  control (NOT "hash meaningfulness" — folding flags into the dep config hash
+  would also be sound, at the cost of more store entries; that is the
+  intended future evolution, gated on explicit opt-in, e.g. custom profiles
+  with `base-config` or an `apply-to-dependencies` flag, and any flag
+  reaching a dep build MUST fold into that dep's config hash).
+- Guardrails, since consumer-only flags against static deps can lie: known
+  **ABI-affecting flags/defines are a hard error** in `[profiles.*]`
+  (`-D_GLIBCXX_DEBUG`, `-D_GLIBCXX_ASSERTIONS`, `-D_GLIBCXX_USE_CXX11_ABI=*`,
+  `-D_LIBCPP_HARDENING_MODE=*`, `-stdlib=*`, `-f*-abi*` — table extensible);
+  `-fsanitize=*` is a **warning** explaining dependencies are uninstrumented
+  (ASan tolerates this and remains useful; MSan/TSan-style whole-world
+  instrumentation is out of scope).
+- Flags route by language: `cxx-flags` only to the C++ driver, `c-flags`
+  only to the C driver.
+
+### Languages
+
+- Extension table (exhaustive; anything else in `sources` is a **hard
+  error**, never silently C++): `.cpp .cc .cxx .c++` → C++; `.c` → C.
+  `.C` is a hard error in v0 (undecidable on macOS's case-insensitive
+  default filesystem; error message suggests renaming). `.m`/`.mm` → clear
+  "Objective-C not supported in v0" error.
+- `c-std` mirrors `cxx-std` for C sources.
+- **Link language rule:** a target containing any C++ source, or any C++
+  target/dependency in its link closure, links with the C++ driver.
+
+### Paths and outputs
+
+- Default project build directory: `./build` (per `CPP_PKG.md`).
+  `build/compile_commands.json` is generated (feeds `cpp-pkg build --query`).
+- `path`-type dependencies (local trees) are **not** in v0. Recorded intent
+  so store assumptions don't foreclose them: path deps will bypass the
+  content-addressed store entirely and always rebuild (mutable source has no
+  stable hash); nothing else about the store design may assume "all deps live
+  in the store".
 
 ## `CppPkg.lock` (v0)
 
@@ -110,8 +204,32 @@ name = "fmt"
 source = "git+https://github.com/fmtlib/fmt"
 requested = "tag:11.2.0"
 commit = "<resolved sha>"
-content-hash = "blake3:<hash of raw download store entry>"
+content-hash = "blake3:<canonical hash — see below>"
+
+[[package]]
+name = "zlib"
+source = "url+https://zlib.net/zlib-1.3.1.tar.gz"
+requested = "sha256:9a93b2b7..."
+content-hash = "blake3:<hash of the archive bytes as downloaded>"
 ```
 
-Written/updated on every resolve; verification behavior may lag the format
-(recorded decision). Committed to the consumer's VCS.
+Grammar is lockfile ABI, pinned here (not left to what the implementation
+happens to print): `source` = `git+<url>` | `url+<url>`; `requested` =
+`tag:<tag>` | `rev:<sha>` | `sha256:<hex>`; `commit` present iff git.
+
+**`content-hash` canonicalization** (the most cornering item in the design —
+fixed before any lockfile ships, because changing it invalidates every
+lockfile in existence):
+
+- `url` sources: blake3 of the archive bytes exactly as downloaded.
+- `git` sources: blake3 of a **canonical tree serialization**: repo-relative
+  paths walked in sorted byte order; each entry contributes
+  `(path, kind, exec-bit, content)` where kind ∈ {file, symlink (content =
+  target string), dir (implicit via paths)}; permissions normalized to the
+  exec bit only; mtimes excluded; `.git` excluded. Submodules: error in v0
+  (a commit pin does not pin submodules; building silently without them is a
+  classic package-manager bug — refuse instead).
+
+Written/updated on every resolve; committed to the consumer's VCS.
+`options`/`needs` are deliberately absent (they live in `CppPkg.toml` and the
+config hash; v0 has no solver whose resolution they'd affect).

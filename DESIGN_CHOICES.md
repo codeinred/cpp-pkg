@@ -62,13 +62,57 @@ extract→emit→extract fixpoint test early. (Transitive `find_dependency`
 resolution via `CMAKE_PREFIX_PATH` is exercised independently in primary mode
 by the spdlog→fmt chain, regardless of this choice.)
 
+## 2026-08-13 — CppPkg.toml v0 schema: oracle review integrated
+
+An oracle subagent adversarially reviewed the draft schema (5 contested
+points). Verdicts: all ACCEPT-WITH-CHANGES, no rejections. Changes adopted
+into `CPPKG_TOML.md` (now normative):
+
+- **Naming:** resolution ladder from `CPP_PKG.md` incorporated (unique →
+  `<depkey>::` prefix → `exposes-namespace`/`exposes-targets`, mapping form
+  renames); ambiguity is a hard error listing candidates; dep keys and target
+  names restricted to `[a-zA-Z0-9_-]+` reserving qualifier syntax;
+  `dependencies` arrays specced string-or-table (strings-only implemented in
+  v0).
+- **Visibility:** static-library `private` deps propagate as link-only edges
+  ($<LINK_ONLY> semantics) — compile reqs stop, artifacts reach the final
+  link closure. Bare-list sugar uniform across includes/defines/deps.
+- **`needs`:** CMAKE_PREFIX_PATH gets the *transitive closure*; entries
+  validated against [dependencies]; cycles error; feeds config hash;
+  not-found AND version-rejection find_dependency failures both translated.
+- **Profiles:** consumer-only flags kept for v0, rationale corrected to
+  scope/store-churn (not "hash meaningfulness"); hard-error denylist for
+  ABI-affecting flags (_GLIBCXX_DEBUG etc.); warning for -fsanitize=*;
+  `base-config` reserved for future custom profiles; evolution path (opt-in
+  flags-to-deps must fold into dep config hash) recorded.
+- **Languages:** exhaustive extension table, unknown ext = hard error; `.C`
+  hard error (case-insensitive FS); `.m/.mm` clear unsupported error; link
+  language rule (any C++ in closure → C++ driver); `c-flags` added;
+  `cxx-extensions` reserved with default **false** (strict `-std=`) decided
+  now.
+- **Lockfile:** `source`/`requested` grammar pinned as ABI; **canonical
+  content-hash defined** (url = archive bytes; git = sorted-path tree
+  serialization, exec-bit-only modes, no mtimes, no .git); **git submodules
+  are an error in v0**. Oracle flagged canonicalization as the single most
+  cornering item — fixed before any lockfile ships.
+- **Also recorded:** CMake `options` hashed as literal strings (never
+  normalize ON/TRUE/1); source globs resolve in sorted byte order; `path`
+  dependencies' future shape (bypass store, always rebuild) written down so
+  store immutability assumptions don't foreclose them.
+- **Sync with updated CPP_PKG.md** (user extended it): binary is `cpp-pkg`
+  (hyphenated); default build dir `./build` + compile_commands.json;
+  `--query` and `--path/--with` prototyping flows noted. Key convention
+  normalized to kebab-case (`exposes-namespace` vs concept doc's snake_case)
+  — user may veto.
+
 ## Open
 - Test dependency shortlist. Proposed: **fmt** (clean, simple installed lib),
   **spdlog** with `SPDLOG_FMT_EXTERNAL=ON` (real transitive
   `find_dependency(fmt)`), **nlohmann_json** (header-only INTERFACE target),
   **libcurl** (non-trivial required configuration + optional transitive
   find_dependency on zlib/OpenSSL). To finalize during test-matrix design.
-- `CppPkg.toml` v0 schema — next design work item (Claude, with oracle
-  subagent for contested points).
-- CLI surface for v0 (`cppkg build --config <debug|release>
-  --toolchain <name|path>` as working assumption).
+- CLI surface for v0: `cpp-pkg build [target(s)]` with `--config
+  <debug|release|...>`, `--toolchain <name|path>`, `--query [path]`, and the
+  `--path <file> --with <dep>...` prototyping flow (per updated CPP_PKG.md).
+  Flag details to finalize during implementation.
+- Probe-project template design (tier 2) — next design work item.

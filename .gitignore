@@ -1,8 +1,8 @@
 # Claude feedback/welfare logs (per user's global CLAUDE.md: not tracked)
 logs/
 
-# CppPkg build output directories (consumer-side build trees)
-.cppkg/
+# CppPkg build output directories (consumer-side build trees; ./build per CPP_PKG.md)
+build/
 
 # Rust build output (once the crate exists)
 target/
