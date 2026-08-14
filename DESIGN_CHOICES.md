@@ -53,13 +53,16 @@ update.
   `NDEBUG`-guarded ABI differences, `_GLIBCXX_ASSERTIONS`, MSVC runtimes
   later). A per-dependency override knob is future work.
 
-## Open
+## 2026-08-13 — Provider mode in v0 (user)
 
-- Shape of test project (d): CMake ≥3.24 dependency-provider mode in v0, or
-  primary-mode transitive resolution only? (Asked 2026-08-13; note that
-  transitive `find_dependency` is satisfied via `CMAKE_PREFIX_PATH` in primary
-  mode regardless — the provider mechanism is only involved when the
-  *consumer's own build* is CMake.)
+Test project (d) uses the CMake ≥3.24 dependency-provider mode: a CMake-built
+consumer resolving deps through CppPkg via `SET_DEPENDENCY_PROVIDER`. This
+pulls **Config-shim emission** into the prototype and unlocks the
+extract→emit→extract fixpoint test early. (Transitive `find_dependency`
+resolution via `CMAKE_PREFIX_PATH` is exercised independently in primary mode
+by the spdlog→fmt chain, regardless of this choice.)
+
+## Open
 - Test dependency shortlist. Proposed: **fmt** (clean, simple installed lib),
   **spdlog** with `SPDLOG_FMT_EXTERNAL=ON` (real transitive
   `find_dependency(fmt)`), **nlohmann_json** (header-only INTERFACE target),

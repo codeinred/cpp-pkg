@@ -17,8 +17,9 @@ why, and any alternatives that were rejected. The concept-level design lives in
    through generated manifests.
 2. **Secondary — CMake dependency provider.** For projects that already make
    substantial use of CMake, CppPkg can be invoked *by* CMake to resolve
-   dependencies only. Ships later, but exercises the same extraction/store
-   machinery.
+   dependencies only. Strategically secondary, but **in v0 prototype scope**
+   (decided 2026-08-13): one test project exercises it, which pulls Config-shim
+   emission and the extract→emit→extract fixpoint test into the prototype.
 
 ## 2. The manifest is the central IR
 
