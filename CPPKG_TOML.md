@@ -43,12 +43,19 @@ link-flags = ["-fsanitize=address"]
 # qualified-reference syntax). Consumers reference the *targets* a package
 # exports, not the package key.
 [dependencies]
-fmt    = { git = "https://github.com/fmtlib/fmt", tag = "11.2.0" }
-spdlog = { git = "https://github.com/gabime/spdlog", tag = "v1.15.3",
-           options = { SPDLOG_FMT_EXTERNAL = "ON" },
-           needs = ["fmt"] }        # find_dependency edge — see Semantics
-zlib   = { url = "https://zlib.net/zlib-1.3.1.tar.gz",
-           sha256 = "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23" }
+fmt = { git = "https://github.com/fmtlib/fmt", tag = "11.2.0" }
+
+# (TOML forbids wrapping inline tables across lines; use a standard table for
+# dependencies with more than a couple of fields.)
+[dependencies.spdlog]
+git     = "https://github.com/gabime/spdlog"
+tag     = "v1.15.3"
+options = { SPDLOG_FMT_EXTERNAL = "ON" }
+needs   = ["fmt"]                   # find_dependency edge — see Semantics
+
+[dependencies.zlib]
+url    = "https://zlib.net/zlib-1.3.1.tar.gz"
+sha256 = "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
 
 # Source forms (exactly one per dependency):
 #   git + tag | git + rev (commit)   — tag resolved to a commit, pinned in

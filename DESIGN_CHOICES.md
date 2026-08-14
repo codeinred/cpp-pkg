@@ -147,6 +147,56 @@ into `CPPKG_TOML.md` (now normative):
   (NO_DEFAULT_PATH); FIND_PACKAGE method only in v0 (FetchContent deferred).
 - **`--path/--with` prototyping flow deferred post-v0.**
 
+## 2026-08-14 — Post-review fix decisions (Claude)
+
+Two independent reviews (correctness + conformance) drove these; semantics
+worth pinning:
+
+- **LINK_ONLY classification:** the inner value of `$<LINK_ONLY:x>` is
+  classified like any other link entry; only *target references* land in the
+  manifest's `link_requires` (the link-only edge kind). Bare libs (`m`,
+  `-lz`), absolute paths, and frameworks go to their ordinary buckets — those
+  carry no compile requirements, so they are link-only by construction, and
+  treating them as component names crashed graph resolution (CMake exports
+  every PRIVATE dep of a static library this way). Consequence: a re-emitted
+  shim spells them unwrapped; extract→emit→extract still reaches a fixpoint
+  after the first normalization.
+- **MAP_IMPORTED_CONFIG precedence:** a set map has full precedence over
+  `IMPORTED_LOCATION_<CONFIG>`, and a set-but-unsatisfied map reads as
+  not-found (no fallback) — matches CMake 4.4 behavior, verified by
+  experiment during review.
+- **§5 find-control/leak detection (initial cut):** every configure cpp-pkg
+  runs (dep build + probe) passes `CMAKE_FIND_USE_{,SYSTEM_}PACKAGE_REGISTRY
+  =OFF` and `CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH=OFF`
+  (PATH-based find_program stays enabled), and after a successful configure
+  the `CMakeCache.txt` is scanned: any `<pkg>_DIR` whose directory really
+  holds a `<pkg>Config.cmake`/`<pkg>-config.cmake` must lie under the store
+  prefixes / the dep's own trees, else a hard error suggests adding the
+  package to `[dependencies]` + `needs`. Full `--debug-find` parsing remains
+  future work; module-mode results (`Find*.cmake`) are deliberately not
+  policed yet.
+- **Provider mode config:** the provider script forwards the consumer's
+  `CMAKE_BUILD_TYPE` (lowercased; empty → release) as `cpp-pkg provide
+  --config`, closing the Debug-consumer-links-Release-artifacts hole.
+- **ABI flag routing to deps:** `-stdlib=*` is written only to
+  `CMAKE_CXX_FLAGS_INIT` in the generated toolchain file (C driver warns
+  "argument unused", fatal under -Werror); the rest of the ABI class goes to
+  both. The config-hash input stays the merged list (no store invalidation).
+- **Submodule detection:** gitlink entries (`git ls-files -s` mode 160000)
+  are checked in addition to `.gitmodules` — a committed gitlink without
+  `.gitmodules` must still hard-error.
+- **Lockfile hygiene:** entries are pruned when their dep key leaves
+  `CppPkg.toml` (full builds only, not `provide`'s closure slice), and the
+  lockfile is saved after each resolution rather than only at the end (a
+  mid-build failure no longer discards pins already used to build store
+  entries).
+- **Naming ladder step 2 is decisive:** when a reference's `<prefix>::`
+  names an existing dependency and the name is not unique, ownership is
+  decided there — export it or error with that dep's export list; it never
+  falls through to exposes-* claims by other packages. An `exposes-targets`
+  rename colliding with a project target name is now a hard error (sibling
+  names win in resolution, so the rename could never be referenced).
+
 ## Open
 - Test dependency shortlist. Proposed: **fmt** (clean, simple installed lib),
   **spdlog** with `SPDLOG_FMT_EXTERNAL=ON` (real transitive
