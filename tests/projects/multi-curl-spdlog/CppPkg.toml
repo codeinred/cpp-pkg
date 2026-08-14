@@ -1,0 +1,75 @@
+schema-version = 1
+
+[package]
+name = "multi-curl-spdlog"
+version = "0.1.0"
+
+[dependencies]
+fmt = { git = "https://github.com/fmtlib/fmt", tag = "11.2.0" }
+
+[dependencies.spdlog]
+git = "https://github.com/gabime/spdlog"
+tag = "v1.15.3"
+options = { SPDLOG_FMT_EXTERNAL = "ON" }
+needs = ["fmt"]
+
+# 8.14.1 is the last curl with Secure Transport (removed in 8.15.0); using it
+# keeps TLS hermetic on macOS (OS frameworks, no Homebrew OpenSSL).
+[dependencies.curl]
+git = "https://github.com/curl/curl"
+tag = "curl-8_14_1"
+
+# Hermetic-ish static libcurl on macOS: Secure Transport for TLS (no OpenSSL
+# fetch), every optional third-party integration that Homebrew could satisfy
+# turned off so the build never links brew dylibs into the store artifact.
+[dependencies.curl.options]
+BUILD_CURL_EXE = "OFF"
+BUILD_SHARED_LIBS = "OFF"
+BUILD_STATIC_LIBS = "ON"
+BUILD_LIBCURL_DOCS = "OFF"
+BUILD_MISC_DOCS = "OFF"
+BUILD_TESTING = "OFF"
+BUILD_EXAMPLES = "OFF"
+CURL_DISABLE_LDAP = "ON"
+CURL_USE_LIBPSL = "OFF"
+CURL_USE_LIBSSH2 = "OFF"
+CURL_BROTLI = "OFF"
+CURL_ZSTD = "OFF"
+USE_NGHTTP2 = "OFF"
+USE_LIBIDN2 = "OFF"
+CURL_USE_SECTRANSP = "ON"
+
+# Static library with a PUBLIC spdlog dependency: consumers (crawler) must
+# receive spdlog's include dirs/defines transitively.
+[targets.netlog]
+type = "static-library"
+sources = ["src/netlog/*.cpp"]
+cxx-std = 17
+includes = { public = ["include"] }
+dependencies = { public = ["spdlog::spdlog"] }
+
+# Static library with a PRIVATE curl dependency: consumers must NOT see
+# curl headers/defines, but the final link must still pull in libcurl and
+# its system frameworks (LINK_ONLY propagation).
+[targets.fetcher]
+type = "static-library"
+sources = ["src/fetcher/*.cpp"]
+cxx-std = 17
+includes = { public = ["include"] }
+# NOTE: curl's canonical consumer name CURL::libcurl is an ALIAS created by
+# CURLConfig.cmake; alias targets are invisible to the IMPORTED_TARGETS
+# probe, so we reference the real imported target CURL::libcurl_static
+# (verified in the store manifest).
+dependencies = { private = ["CURL::libcurl_static"] }
+
+[targets.crawler]
+type = "executable"
+sources = ["src/crawler/main.cpp"]
+cxx-std = 17
+dependencies = ["netlog", "fetcher"]
+
+[targets.version-dump]
+type = "executable"
+sources = ["src/version_dump/main.cpp"]
+cxx-std = 17
+dependencies = ["CURL::libcurl_static", "spdlog::spdlog"]

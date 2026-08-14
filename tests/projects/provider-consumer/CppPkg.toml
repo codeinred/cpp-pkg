@@ -1,0 +1,13 @@
+schema-version = 1
+
+# PROVIDER MODE consumer: this project's own build is CMake (see
+# CMakeLists.txt). This manifest exists only so the cpp-pkg dependency
+# provider (`cpp-pkg provide`, invoked from cppkg_provider.cmake) can resolve
+# the consumer's find_package() calls against declared, locked dependencies.
+# No [targets] section: cpp-pkg does not drive this project's compilation.
+
+[package]
+name = "provider-consumer"
+
+[dependencies]
+fmt = { git = "https://github.com/fmtlib/fmt", tag = "11.2.0" }

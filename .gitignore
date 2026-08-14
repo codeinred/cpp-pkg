@@ -6,3 +6,6 @@ build/
 
 # Rust build output (once the crate exists)
 target/
+
+# Generated provider scripts are machine-specific (absolute binary path baked in)
+cppkg_provider.cmake

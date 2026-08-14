@@ -129,6 +129,19 @@ NOTE: manifests cached in existing stores before this fix may still carry
 bare libs in link_requires — wipe the store (or bump nothing; hashes are
 unchanged) if a PLAN ERROR `unknown dependency reference` appears.
 
+## Test-project campaign (2026-08-14)
+
+tests/projects/{exe-fmt,lib-json,multi-curl-spdlog,provider-consumer} all
+GREEN first round against real deps (fmt, nlohmann_json, spdlog+external-fmt
+via needs, static curl-8_14_1, provider mode). Key facts: curl's
+CURL::libcurl is an ALIAS → invisible to tier-2 probe, reference
+CURL::libcurl_static (limitation logged in DESIGN_CHOICES); curl ≥8.15
+dropped SecureTransport (pin 8_14_1 for hermetic macOS TLS); new
+`cpp-pkg provider-script --dir <d>` subcommand emits the provider script
+(machine-specific, gitignored). v0 scope is now complete on macOS; next
+frontiers: Linux (user), tier-3 extraction, --path/--with, INTERFACE_SOURCES
+real-world validation, alias resolution in probe.
+
 ## Useful CMake mechanics established earlier
 
 - Enumerate imported targets: diff directory property `IMPORTED_TARGETS`

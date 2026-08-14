@@ -197,6 +197,42 @@ worth pinning:
   rename colliding with a project target name is now a hard error (sibling
   names win in resolution, so the rename could never be referenced).
 
+## 2026-08-14 — Test-project family green; findings from real dependencies
+
+All four v0 test projects (tests/projects/) went green on the FIRST round —
+no fix cycles: exe-fmt (fmt 11.2.0), lib-json (nlohmann_json v3.12.0,
+Interface extraction + public/private propagation proven via --query),
+multi-curl-spdlog (spdlog SPDLOG_FMT_EXTERNAL + needs=[fmt] transitive
+find_dependency; curl-8_14_1 static with full options set — LINK_ONLY bare
+libs, macOS frameworks, SDK zlib .tbd all extracted correctly; binaries link
+against zero Homebrew dylibs), provider-consumer (CMake 3.24
+SET_DEPENDENCY_PROVIDER end-to-end, store-cache reconfigure 0.24s).
+
+Decisions/limitations recorded from the campaign:
+
+- **New subcommand `cpp-pkg provider-script --dir <d>`** emits
+  cppkg_provider.cmake (binary path baked in; machine-specific, gitignored).
+  Closes the gap where only a unit test invoked shim::write_provider_script.
+- **Known limitation (tier-2): ALIAS imported targets are invisible** to the
+  IMPORTED_TARGETS diff — e.g. curl's `CURL::libcurl` is an alias of
+  `CURL::libcurl_static`; users must reference the underlying imported name.
+  The failure error is clear and the store manifest makes diagnosis easy.
+  Future fix idea: scan config files for add_library(... ALIAS) during probe.
+- **Project-level lesson (documented in multi-curl-spdlog README):** curl
+  8.15 removed Secure Transport; CURL_USE_SECTRANSP silently becomes unused
+  and configure falls back to Homebrew OpenSSL (non-hermetic). Pin
+  curl-8_14_1 or use CURL_ENABLE_SSL=OFF. Hermeticity checks that would
+  catch this automatically (store manifest referencing paths outside store +
+  SDK) are a good future guard.
+- Minor extraction observations (non-blocking, logged for later): manifest
+  include paths can appear duplicated per component (deduped downstream);
+  nlohmann's config also defines an un-namespaced `nlohmann_json` component
+  (faithful to upstream, kept).
+- Test projects keep their CppPkg.lock committed (deliberate — exercises the
+  lockfile path); build/ dirs and generated provider scripts are gitignored;
+  per-project .clangd points at build/compile_commands.json so editors
+  resolve includes.
+
 ## Open
 - Test dependency shortlist. Proposed: **fmt** (clean, simple installed lib),
   **spdlog** with `SPDLOG_FMT_EXTERNAL=ON` (real transitive

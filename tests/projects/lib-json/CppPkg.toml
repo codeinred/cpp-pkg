@@ -1,0 +1,30 @@
+schema-version = 1
+
+[package]
+name = "lib-json"
+version = "0.1.0"
+
+[dependencies.nlohmann_json]
+git = "https://github.com/nlohmann/json"
+tag = "v3.12.0"
+# The dep configures as a top-level project, where JSON_BuildTests defaults ON;
+# turn the test suite off so the store build is just the install of headers.
+options = { JSON_BuildTests = "OFF" }
+
+# Library-centric layout: jsonutil wraps nlohmann_json and re-exports it via a
+# PUBLIC dependency (its public header includes <nlohmann/json.hpp>). The
+# private include dir (src/detail) must NOT propagate to consumers.
+[targets.jsonutil]
+type = "static-library"
+sources = ["src/*.cpp"]
+cxx-std = 17
+includes = { public = ["include"], private = ["src/detail"] }
+dependencies = { public = ["nlohmann_json::nlohmann_json"] }
+
+# The executable declares ONLY jsonutil; nlohmann_json's usage requirements
+# must arrive transitively through jsonutil's PUBLIC edge.
+[targets.jsondemo]
+type = "executable"
+sources = ["app/main.cpp"]
+cxx-std = 17
+dependencies = ["jsonutil"]

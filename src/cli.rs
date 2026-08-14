@@ -75,6 +75,14 @@ enum Cmd {
         #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
         query: Option<String>,
     },
+    /// Emit the CMake dependency-provider script (cppkg_provider.cmake) into
+    /// DIR, with this cpp-pkg binary's path baked in. Use it from a CMake
+    /// consumer via -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES=<emitted path>.
+    ProviderScript {
+        /// Directory to write cppkg_provider.cmake into.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
     /// Internal: resolve one package for the CMake dependency provider and
     /// print the emitted Config.cmake shim directory on stdout.
     #[command(hide = true)]
@@ -99,12 +107,23 @@ pub fn run() -> Result<()> {
             toolchain,
             query,
         } => build(&targets, &config, toolchain.as_deref(), query.as_deref()),
+        Cmd::ProviderScript { dir } => provider_script(&dir),
         Cmd::Provide {
             package,
             project,
             config,
         } => provide(&package, &project, &config),
     }
+}
+
+/// `provider-script`: emit cppkg_provider.cmake and print its path. The
+/// script bakes in this binary's absolute path, so it is machine-specific
+/// and should be regenerated rather than committed.
+fn provider_script(dir: &Path) -> Result<()> {
+    let bin = std::env::current_exe().context("resolving the cpp-pkg binary path")?;
+    let path = shim::write_provider_script(dir, &bin)?;
+    println!("{}", path.display());
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

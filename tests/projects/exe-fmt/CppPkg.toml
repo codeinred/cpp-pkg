@@ -1,0 +1,14 @@
+schema-version = 1
+
+[package]
+name = "exe-fmt"
+version = "0.1.0"
+
+[dependencies]
+fmt = { git = "https://github.com/fmtlib/fmt", tag = "11.2.0" }
+
+[targets.exe-fmt]
+type = "executable"
+sources = ["src/main.cpp"]
+cxx-std = 17
+dependencies = ["fmt::fmt"]
