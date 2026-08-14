@@ -1,6 +1,8 @@
-# cpp-pkg migration of ninja-build/ninja v1.13.2 (macOS/posix configuration).
-# Source of truth lives in cpp-pkg's migrations/ninja/; pin.sh copies it next
-# to the upstream checkout. See README.md and GAPS.md alongside this file.
+# cpp-pkg migration of ninja-build/ninja v1.13.2 — wave-2 edition.
+# One manifest for macOS + Linux (Windows branches declared; no Windows
+# toolchain exists yet, so they are validated-never-expanded). Source of
+# truth lives in cpp-pkg's migrations/ninja/; pin.sh copies it next to the
+# upstream checkout. See README.md and GAPS.md alongside this file.
 
 schema-version = 1
 
@@ -8,56 +10,95 @@ schema-version = 1
 name = "ninja"
 version = "1.13.2"
 
-# GoogleTest is a TEST-ONLY dependency upstream (only fetched when
-# BUILD_TESTING=ON and no system GTest). cpp-pkg has no dev-dependency
-# notion, so it is a full dependency of the project: even `cpp-pkg build
-# ninja` fetches and builds it. (GAPS.md: testing-story.)
-#
-# v1.16.0 matches the exact version upstream pins via FetchContent
-# (URL tarball + SHA256); we express it as a git tag instead because that is
-# the idiomatic cpp-pkg form. Installed GTest exports the `GTest::` namespace
-# from GTestConfig.cmake, so the probe must call find_package(GTest), not
-# find_package(googletest) — hence `find-package`.
-[dependencies.googletest]
+# ---------------------------------------------------------------------------
+# GoogleTest is test-only upstream (fetched only when BUILD_TESTING=ON and no
+# system GTest exists). As a dev-dependency, `cpp-pkg build` of the binary
+# does no gtest work — [dependencies] is empty again, matching upstream's
+# "zero dependencies" selling point. v1.16.0 is the exact version upstream
+# pins (v1.17 needs C++17, above ninja's C++11 floor). Installed GTest
+# exports the GTest:: namespace from GTestConfig.cmake, so the probe must
+# call find_package(GTest) — hence `find-package`.
+[dev-dependencies.googletest]
 git = "https://github.com/google/googletest"
 tag = "v1.16.0"
 find-package = "GTest"
 options = { BUILD_GMOCK = "OFF" }
 
-# Upstream applies -Wno-deprecated globally (add_compile_options after a
-# compiler check). cpp-pkg's only flag mechanism is per-PROFILE consumer
-# flags, so the flag must be repeated once per built-in profile to cover any
-# --config value; there is no per-target or profile-independent flag slot.
-# (GAPS.md: per-target-flags, schema-ergonomics.)
-[profiles.release]
+# ---------------------------------------------------------------------------
+# Upstream: check_cxx_compiler_flag(-Wno-deprecated) then
+# add_compile_options(-Wno-deprecated) on every NON-MSVC compiler. v1 cfg has
+# no not(msvc)/all() combinators, so the two unix compiler atoms each carry
+# the flag (identical effect on the supported platforms); the msvc block
+# carries upstream's /W4 set for the day a Windows toolchain exists.
+# This replaces wave 1's four identical [profiles.*] stanzas.
+[flags.cfg.clang]
 cxx-flags = ["-Wno-deprecated"]
 
-[profiles.debug]
+[flags.cfg.gcc]
 cxx-flags = ["-Wno-deprecated"]
 
-[profiles.relwithdebinfo]
-cxx-flags = ["-Wno-deprecated"]
-
-[profiles.minsizerel]
-cxx-flags = ["-Wno-deprecated"]
+# transcribed: if(MSVC) add_compile_options(/W4 /wd4100 /wd4267 /wd4706
+# /wd4702 /wd4244 /GR- /Zc:__cplusplus)
+[flags.cfg.msvc]
+cxx-flags = [
+    "/W4", "/wd4100", "/wd4267", "/wd4706", "/wd4702", "/wd4244",
+    "/GR-", "/Zc:__cplusplus",
+]
 
 # ---------------------------------------------------------------------------
-# Upstream builds libninja and libninja-re2c as CMake OBJECT libraries.
-# cpp-pkg has no object-library kind, so both are static archives here; the
-# observable difference (archives pull members by undefined-symbol need,
-# object libs link everything) does not bite ninja — no self-registration
-# patterns. (GAPS.md: object-libraries.)
+# Browse-mode codegen: upstream pipes src/browse.py through src/inline.sh to
+# produce build/browse_py.h (add_custom_command). Now a real build edge:
+# reruns when browse.py or inline.sh change (wave 1's pin.sh pre-generation
+# went stale silently). Output lands at ${gen}/build/browse_py.h; browse.cc
+# does `#include "build/browse_py.h"`, so the ninja target adds ${gen} as a
+# private include dir.
+#
+# transcribed: check_platform_supports_browse_mode() — inline.sh works and
+# fork/pipe exist on both macOS and Linux, so the step and the browse.cc
+# source are unconditional here (a has-symbol probe predicate is layer 2).
+[generate.browse-py-h]
+command = ["sh", "src/inline.sh", "kBrowsePy"]
+stdin   = "src/browse.py"
+stdout  = "build/browse_py.h"
+inputs  = ["src/inline.sh"]
 
-# Core sources, POSIX/macOS flavor. Upstream lists 27 platform-neutral files
-# and appends jobserver-posix.cc + subprocess-posix.cc inside if(NOT WIN32).
-# cpp-pkg has no conditional sources, so this list is hard-wired to the posix
-# set and the manifest is not portable to Windows. A naive glob (src/*.cc)
-# is impossible: it would sweep in *_test.cc, *_perftest.cc, *-win32.cc,
-# browse.cc, ninja.cc and the re2c inputs (*.in.cc also match *.cc).
-# (GAPS.md: conditional-sources.)
+# re2c lexers: upstream regenerates depfile_parser.cc/lexer.cc when re2c >= 2
+# is installed and falls back to the committed outputs otherwise. checked-in
+# mode is exactly that pattern, made explicit: `cpp-pkg build` compiles the
+# committed files with no questions asked; `cpp-pkg gen` regenerates them
+# (needs re2c on PATH); `cpp-pkg gen --check` byte-diffs (CI drift guard).
+# argv = upstream's re2c flags minus `-o` (without -o re2c writes to stdout,
+# which the runner captures as the declared output).
+[generate.depfile-parser]
+command    = ["re2c", "-b", "-i", "--no-generation-date", "--no-version",
+              "src/depfile_parser.in.cc"]
+stdout     = "depfile_parser.cc"
+inputs     = ["src/depfile_parser.in.cc"]
+checked-in = "src/depfile_parser.cc"
+
+[generate.lexer]
+command    = ["re2c", "-b", "-i", "--no-generation-date", "--no-version",
+              "src/lexer.in.cc"]
+stdout     = "lexer.cc"
+inputs     = ["src/lexer.in.cc"]
+checked-in = "src/lexer.cc"
+
+# ---------------------------------------------------------------------------
+# Every target is C++11 (target_compile_features cxx_std_11); ninja_test
+# overrides to 14 (scalar defaults fill-if-absent, target wins).
+[target-defaults]
+cxx-std = 11
+
+# ---------------------------------------------------------------------------
+# Upstream builds libninja/libninja-re2c as CMake OBJECT libraries; cpp-pkg
+# still has no object-library kind, so both are static archives. Ninja has no
+# self-registering TUs, so archives are observationally equivalent (GAPS.md:
+# object-libraries / B11).
+
+# Core library: 27 platform-neutral sources, then upstream's if(WIN32)/else()
+# split — now real cfg branches instead of a hard-wired posix projection.
 [targets.libninja]
 type = "static-library"
-cxx-std = 11
 sources = [
     "src/build_log.cc",
     "src/build.cc",
@@ -86,49 +127,72 @@ sources = [
     "src/string_piece_util.cc",
     "src/util.cc",
     "src/version.cc",
-    # posix-only pair (WIN32 uses subprocess-win32.cc, jobserver-win32.cc,
-    # includes_normalize-win32.cc, msvc_helper-win32.cc,
-    # msvc_helper_main-win32.cc, minidump-win32.cc, getopt.c):
-    "src/jobserver-posix.cc",
-    "src/subprocess-posix.cc",
 ]
 
-# Upstream: pre-generated re2c outputs compiled as their own object library
-# (regenerated at build time only if re2c >= 2 is installed; this machine has
-# no re2c, so the CMake baseline also compiles the committed files —
-# byte-for-byte the same inputs as here). (GAPS.md: codegen-escape-hatch.)
+[targets.libninja.cfg.unix]
+# upstream: else() branch of if(WIN32)
+sources = ["src/jobserver-posix.cc", "src/subprocess-posix.cc"]
+
+[targets.libninja.cfg.linux]
+# transcribed: check_cxx_symbol_exists(ppoll poll.h HAVE_PPOLL) →
+# add_compile_definitions(USE_PPOLL=1). True on Linux (glibc and musl),
+# false on macOS (no ppoll — wave 1's silent pselect fallback is dead).
+# Public, not private: upstream's define is directory-global and
+# subprocess_test.cc (in ninja_test) branches on it too — the public edge
+# carries it to every consumer, exactly the set of TUs that can see
+# subprocess.h.
+defines = { public = ["USE_PPOLL=1"] }
+
+[targets.libninja.cfg.windows]
+# upstream: if(WIN32) target_sources(...) + global NOMINMAX. getopt.c is
+# compiled as C++ upstream (set_source_files_properties LANGUAGE CXX); the
+# extension table has no per-source override, so here it compiles as C —
+# recorded divergence (GAPS.md), moot until a Windows toolchain exists.
+# NOMINMAX is public for the same reason USE_PPOLL is: upstream declares it
+# globally so windows.h consumers anywhere in the graph stay sane.
+sources = [
+    "src/subprocess-win32.cc",
+    "src/includes_normalize-win32.cc",
+    "src/jobserver-win32.cc",
+    "src/msvc_helper-win32.cc",
+    "src/msvc_helper_main-win32.cc",
+    "src/getopt.c",
+    "src/minidump-win32.cc",
+]
+defines = { public = ["NOMINMAX"] }
+
+[targets.libninja.cfg.msvc]
+# transcribed: if(MSVC) add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+defines = { public = ["_CRT_SECURE_NO_WARNINGS"] }
+
+# Committed re2c outputs, compiled as their own library (see [generate]).
 [targets.libninja-re2c]
 type = "static-library"
-cxx-std = 11
 sources = ["src/depfile_parser.cc", "src/lexer.cc"]
 includes = { private = ["src"] }
 
-# The ninja binary: main() + browse mode. Upstream inlines src/browse.py into
-# a generated header via `src/inline.sh kBrowsePy < src/browse.py >
-# build/browse_py.h` (add_custom_command). cpp-pkg has no codegen step, so
-# pin.sh pre-generates gen/build/browse_py.h with the same command and this
-# target adds `gen` as a private include dir (browse.cc does
-# `#include "build/browse_py.h"`). (GAPS.md: codegen-escape-hatch.)
-#
+# The ninja binary: main() + browse mode. browse_py.h is a generate edge now;
+# ${gen} is the include root because browse.cc includes "build/browse_py.h".
 # NINJA_PYTHON/NINJA_HAVE_BROWSE are per-SOURCE-FILE properties upstream
-# (set_source_files_properties on browse.cc); here they are target-wide,
-# which is harmless for this project. (GAPS.md: per-target-flags.)
+# (set_source_files_properties on browse.cc); target-private here — harmless
+# for a two-file target (GAPS.md: per-source properties still unaddressed).
 [targets.ninja]
 type = "executable"
-cxx-std = 11
 sources = ["src/ninja.cc", "src/browse.cc"]
-includes = { private = ["gen"] }
+includes = { private = ["${gen}"] }
 defines = { private = ["NINJA_HAVE_BROWSE", 'NINJA_PYTHON="python"'] }
 dependencies = ["libninja", "libninja-re2c"]
+install = true
 
-# Tests: upstream's exact non-WIN32 ninja_test source list. GTest v1.16
-# requires C++14, hence the bump from 11 (upstream gets the same effect via
-# feature-max between cxx_std_11 and gtest's INTERFACE requirement).
-# Upstream also links Threads::Threads; on macOS pthreads live in libSystem,
-# so no explicit edge is needed (GTestConfig's find_dependency(Threads) is
-# handled inside the probe). (GAPS.md: dep-provisioning.)
+# ---------------------------------------------------------------------------
+# Tests: upstream's ninja_test source list + the WIN32-only pair as a cfg
+# branch. GTest v1.16 requires C++14, hence the override of the default 11.
+# Threads::Threads is the wave-1 builtin: upstream links it explicitly
+# (find_package(Threads REQUIRED)); it expands to -pthread on Linux and to
+# nothing on macOS — the edge is now declared instead of relying on libSystem.
 [targets.ninja_test]
 type = "executable"
+test = true
 cxx-std = 14
 sources = [
     "src/build_log_test.cc",
@@ -155,49 +219,66 @@ sources = [
     "src/test.cc",
     "src/util_test.cc",
 ]
-dependencies = ["libninja", "libninja-re2c", "GTest::gtest"]
+dependencies = ["libninja", "libninja-re2c", "GTest::gtest", "Threads::Threads"]
 
-# Perf/bench executables (upstream builds these under BUILD_TESTING via a
-# foreach loop — 4 CMake lines for 7 targets; here: 7 near-identical stanzas.
-# (GAPS.md: schema-ergonomics.)
+[targets.ninja_test.cfg.windows]
+sources = ["src/includes_normalize_test.cc", "src/msvc_helper_test.cc"]
+
+[targets.ninja_test.cfg.msvc]
+# transcribed: if(MSVC) target_compile_definitions(ninja_test PRIVATE
+# _CRT_NONSTDC_NO_DEPRECATE)  (silences unlink-vs-_unlink warnings)
+defines = { private = ["_CRT_NONSTDC_NO_DEPRECATE"] }
+
+# The tests create files/directories in the cwd; upstream runs them from the
+# CMake build dir. A scratch cwd inside build/ is auto-created by the runner.
+[[targets.ninja_test.run]]
+name = "NinjaTest"
+cwd  = "build/ninja_test-scratch"
+
+# ---------------------------------------------------------------------------
+# Perf/bench executables: upstream builds these under BUILD_TESTING but never
+# add_test()s them — dev targets, deliberately NOT tests (the label would
+# lie). Out of the default build; built by explicit name or as part of dev
+# workflows. (Still seven stanzas for upstream's 4-line foreach — GAPS.md:
+# schema-ergonomics.)
 [targets.build_log_perftest]
 type = "executable"
-cxx-std = 11
+dev  = true
 sources = ["src/build_log_perftest.cc"]
 dependencies = ["libninja", "libninja-re2c"]
 
 [targets.canon_perftest]
 type = "executable"
-cxx-std = 11
+dev  = true
 sources = ["src/canon_perftest.cc"]
 dependencies = ["libninja", "libninja-re2c"]
 
 [targets.clparser_perftest]
 type = "executable"
-cxx-std = 11
+dev  = true
 sources = ["src/clparser_perftest.cc"]
 dependencies = ["libninja", "libninja-re2c"]
 
 [targets.depfile_parser_perftest]
 type = "executable"
-cxx-std = 11
+dev  = true
 sources = ["src/depfile_parser_perftest.cc"]
 dependencies = ["libninja", "libninja-re2c"]
 
 [targets.elide_middle_perftest]
 type = "executable"
-cxx-std = 11
+dev  = true
 sources = ["src/elide_middle_perftest.cc"]
 dependencies = ["libninja", "libninja-re2c"]
 
 [targets.hash_collision_bench]
 type = "executable"
-cxx-std = 11
+dev  = true
 sources = ["src/hash_collision_bench.cc"]
 dependencies = ["libninja", "libninja-re2c"]
 
 [targets.manifest_parser_perftest]
 type = "executable"
-cxx-std = 11
+dev  = true
 sources = ["src/manifest_parser_perftest.cc"]
 dependencies = ["libninja", "libninja-re2c"]

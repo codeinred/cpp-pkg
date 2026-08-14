@@ -1,23 +1,32 @@
-# googletest v1.18.0 built by cpp-pkg. This file is copied to the upstream
-# checkout root by pin.sh; sources/includes are relative to that root.
+# googletest v1.18.0 built by cpp-pkg — wave-2 edition (post wave-1
+# extensions). This file is copied to the upstream checkout root by pin.sh;
+# sources/includes are relative to that root.
 #
 # Mirrors the non-MSVC path of upstream's community CMake build:
 #   - umbrella compilation (gtest-all.cc / gmock-all.cc), one object per lib,
 #     same as upstream's cxx_library() calls
-#   - the source dir itself (googletest/, googlemock/) is on the include path:
-#     needed privately so gtest-all.cc can `#include "src/gtest.cc"`, and
-#     upstream also exports it in its INTERFACE include dirs (gtest_build_
-#     include_dirs goes into target_include_directories(... SYSTEM INTERFACE)),
-#     so it is public here for parity.
-#   - cxx_std_17 is PUBLIC in upstream (target_compile_features); cpp-pkg has
-#     no propagating cxx-std, so each consumer target repeats cxx-std = 17.
-#   - GTEST_HAS_PTHREAD=1: upstream passes -DGTEST_HAS_PTHREAD=1 in
-#     COMPILE_FLAGS (private) when find_package(Threads) succeeds; private
-#     define here. Consumers rely on gtest-port.h autodetection (as with
-#     upstream's installed package).
-#   - upstream's strict warning set (-Wall -Wshadow -Wconversion -Wundef -W
-#     -Wpointer-arith ... on the libs only) is NOT reproduced: cpp-pkg has no
-#     per-target flags. See GAPS.md (per-target-flags).
+#   - the source dir itself (googletest/, googlemock/) is public alongside
+#     include/: needed so gtest-all.cc can `#include "src/gtest.cc"`, and
+#     upstream exports both dirs SYSTEM INTERFACE (gtest_build_include_dirs).
+#     `system-includes = true` reproduces the SYSTEM part for consumers.
+#   - `public-headers` overrides keep the *installed* header set to
+#     googletest/include + googlemock/include only (upstream's
+#     $<INSTALL_INTERFACE:include>), even though the source dirs are public
+#     build-interface includes.
+#   - upstream's warning sets are transcribed from
+#     googletest/cmake/internal_utils.cmake config_compiler_and_linker():
+#     cxx_base_flags (every target) -> [flags.cfg.<compiler>];
+#     cxx_strict_flags (libraries only) -> per-target private cxx-flags under
+#     cfg.<compiler>. Note: cpp-pkg's `clang` predicate matches AppleClang,
+#     so on macOS these fire — upstream's own `STREQUAL "Clang"` check fails
+#     for AppleClang and its reference build compiles warning-free there.
+#     Same artifacts, richer diagnostics; the divergence is deliberate
+#     (upstream behavior is the documented STREQUAL footgun).
+#   - MSVC branch (cxx_base_flags = -GS -W4 -wd4251 -wd4275 -nologo -J
+#     -D_UNICODE -DUNICODE -DWIN32 -D_WIN32 -DSTRICT -DWIN32_LEAN_AND_MEAN
+#     -wd4702, CRT selection gated on gtest_force_shared_crt) is NOT
+#     transcribed: the runtime-library choice is option-gated (no options in
+#     cpp-pkg) and Windows toolchains are out of v1 scope.
 
 schema-version = 1
 
@@ -25,99 +34,157 @@ schema-version = 1
 name = "googletest"
 version = "1.18.0"
 
+# Adopting CppPkg.toml must not orphan the find_package(GTest) ecosystem:
+# export under upstream's CMake package name and namespace.
+[export]
+cmake-name = "GTest"
+namespace = "GTest"
+
+[target-defaults]
+cxx-std = 17               # upstream: target_compile_features(... PUBLIC cxx_std_17), once
+install = true             # fills the 4 libraries; samples are test targets -> skipped
+# transcribed: config_compiler_and_linker() sets GTEST_HAS_PTHREAD_MACRO=1
+# into cxx_base_flags iff find_package(Threads) yields CMAKE_USE_PTHREADS_INIT
+# (i.e. on pthread platforms; =0 on MSVC/MinGW). [target-defaults.cfg.*] is
+# reserved, so this is unconditional here — correct on macos/linux, wrong for
+# a future Windows toolchain (see GAPS.md, Remaining).
+defines = { private = ["GTEST_HAS_PTHREAD=1"] }
+
+# Upstream cxx_base_flags + cxx_exception_flags (cxx_default) apply to every
+# target it builds — environment scope, i.e. [flags].
+[flags.cfg.clang]          # transcribed: CMAKE_CXX_COMPILER_ID STREQUAL "Clang" (+ AppleClang, see header)
+cxx-flags = ["-Wall", "-Wshadow", "-Wconversion", "-Wundef", "-fexceptions"]
+
+[flags.cfg.gcc]            # transcribed: CMAKE_COMPILER_IS_GNUCXX branch (gcc >= 7 form)
+cxx-flags = ["-Wall", "-Wshadow", "-Wundef", "-Wno-error=dangling-else", "-fexceptions"]
+
 # ---------------------------------------------------------------- libraries
+# Upstream links Threads::Threads PUBLIC on every cxx_library when
+# GTEST_HAS_PTHREAD — Threads::Threads is now a builtin (no declaration;
+# expands to -pthread on linux, nothing on macos/windows: exactly upstream's
+# effective behavior).
 
 [targets.gtest]
 type = "static-library"
 sources = ["googletest/src/gtest-all.cc"]
-cxx-std = 17
 includes = { public = ["googletest/include", "googletest"] }
-defines = { private = ["GTEST_HAS_PTHREAD=1"] }
+dependencies = { public = ["Threads::Threads"] }
+system-includes = true
+public-headers = { base = "googletest/include", patterns = ["**/*.h"] }
+
+[targets.gtest.cfg.clang]  # transcribed: cxx_strict_flags, Clang branch (libs only)
+cxx-flags = { private = ["-W", "-Wpointer-arith", "-Wreturn-type", "-Wcast-qual", "-Wwrite-strings", "-Wswitch", "-Wunused-parameter", "-Wcast-align", "-Winline", "-Wredundant-decls", "-Wchar-subscripts"] }
+
+[targets.gtest.cfg.gcc]    # transcribed: cxx_strict_flags, GNUCXX branch
+cxx-flags = { private = ["-Wextra", "-Wno-unused-parameter", "-Wno-missing-field-initializers"] }
 
 [targets.gtest_main]
 type = "static-library"
 sources = ["googletest/src/gtest_main.cc"]
-cxx-std = 17
-defines = { private = ["GTEST_HAS_PTHREAD=1"] }
-dependencies = { public = ["gtest"] }
+includes = { public = ["googletest/include", "googletest"] }
+dependencies = { public = ["gtest", "Threads::Threads"] }
+system-includes = true
+public-headers = { base = "googletest/include", patterns = ["**/*.h"] }
+
+[targets.gtest_main.cfg.clang]
+cxx-flags = { private = ["-W", "-Wpointer-arith", "-Wreturn-type", "-Wcast-qual", "-Wwrite-strings", "-Wswitch", "-Wunused-parameter", "-Wcast-align", "-Winline", "-Wredundant-decls", "-Wchar-subscripts"] }
+
+[targets.gtest_main.cfg.gcc]
+cxx-flags = { private = ["-Wextra", "-Wno-unused-parameter", "-Wno-missing-field-initializers"] }
 
 [targets.gmock]
 type = "static-library"
 sources = ["googlemock/src/gmock-all.cc"]
-cxx-std = 17
 includes = { public = ["googlemock/include", "googlemock"] }
-defines = { private = ["GTEST_HAS_PTHREAD=1"] }
-dependencies = { public = ["gtest"] }
+dependencies = { public = ["gtest", "Threads::Threads"] }
+system-includes = true
+public-headers = { base = "googlemock/include", patterns = ["**/*.h"] }
+
+[targets.gmock.cfg.clang]
+cxx-flags = { private = ["-W", "-Wpointer-arith", "-Wreturn-type", "-Wcast-qual", "-Wwrite-strings", "-Wswitch", "-Wunused-parameter", "-Wcast-align", "-Winline", "-Wredundant-decls", "-Wchar-subscripts"] }
+
+[targets.gmock.cfg.gcc]
+cxx-flags = { private = ["-Wextra", "-Wno-unused-parameter", "-Wno-missing-field-initializers"] }
 
 [targets.gmock_main]
 type = "static-library"
 sources = ["googlemock/src/gmock_main.cc"]
-cxx-std = 17
-defines = { private = ["GTEST_HAS_PTHREAD=1"] }
-dependencies = { public = ["gmock"] }
+includes = { public = ["googlemock/include", "googlemock"] }
+dependencies = { public = ["gmock", "Threads::Threads"] }
+system-includes = true
+public-headers = { base = "googlemock/include", patterns = ["**/*.h"] }
+
+[targets.gmock_main.cfg.clang]
+cxx-flags = { private = ["-W", "-Wpointer-arith", "-Wreturn-type", "-Wcast-qual", "-Wwrite-strings", "-Wswitch", "-Wunused-parameter", "-Wcast-align", "-Winline", "-Wredundant-decls", "-Wchar-subscripts"] }
+
+[targets.gmock_main.cfg.gcc]
+cxx-flags = { private = ["-Wextra", "-Wno-unused-parameter", "-Wno-missing-field-initializers"] }
 
 # ---------------------------------------------------------------- samples
-# Upstream builds these only under -Dgtest_build_samples=ON; cpp-pkg has no
-# option-gated targets, so they are unconditional here (GAPS.md:
-# testing-story / conditional-sources). Source lists mirror
-# cxx_executable(<name> samples <lib> [extra srcs]) exactly.
+# Upstream gates these behind -Dgtest_build_samples=ON. `test = true` is the
+# wave-1 answer: they leave the default build (`cpp-pkg build` = 4 libs),
+# build+run under `cpp-pkg test`, and are excluded from install/export.
+# Source lists mirror cxx_executable(<name> samples <lib> [extra srcs]).
+# No [[run]] entries: one default invocation each is exactly the suite
+# (all 10 exit 0; sample9's intentional CustomOutputTest.Fails failure is
+# swallowed by its custom listener demo, rc=0 by upstream design).
 
 [targets.sample1_unittest]
 type = "executable"
+test = true
 sources = ["googletest/samples/sample1_unittest.cc", "googletest/samples/sample1.cc"]
-cxx-std = 17
 dependencies = ["gtest_main"]
 
 [targets.sample2_unittest]
 type = "executable"
+test = true
 sources = ["googletest/samples/sample2_unittest.cc", "googletest/samples/sample2.cc"]
-cxx-std = 17
 dependencies = ["gtest_main"]
 
 [targets.sample3_unittest]
 type = "executable"
+test = true
 sources = ["googletest/samples/sample3_unittest.cc"]
-cxx-std = 17
 dependencies = ["gtest_main"]
 
 [targets.sample4_unittest]
 type = "executable"
+test = true
 sources = ["googletest/samples/sample4_unittest.cc", "googletest/samples/sample4.cc"]
-cxx-std = 17
 dependencies = ["gtest_main"]
 
 [targets.sample5_unittest]
 type = "executable"
+test = true
 sources = ["googletest/samples/sample5_unittest.cc", "googletest/samples/sample1.cc"]
-cxx-std = 17
 dependencies = ["gtest_main"]
 
 [targets.sample6_unittest]
 type = "executable"
+test = true
 sources = ["googletest/samples/sample6_unittest.cc"]
-cxx-std = 17
 dependencies = ["gtest_main"]
 
 [targets.sample7_unittest]
 type = "executable"
+test = true
 sources = ["googletest/samples/sample7_unittest.cc"]
-cxx-std = 17
 dependencies = ["gtest_main"]
 
 [targets.sample8_unittest]
 type = "executable"
+test = true
 sources = ["googletest/samples/sample8_unittest.cc"]
-cxx-std = 17
 dependencies = ["gtest_main"]
 
 [targets.sample9_unittest]
 type = "executable"
+test = true
 sources = ["googletest/samples/sample9_unittest.cc"]
-cxx-std = 17
 dependencies = ["gtest"]
 
 [targets.sample10_unittest]
 type = "executable"
+test = true
 sources = ["googletest/samples/sample10_unittest.cc"]
-cxx-std = 17
 dependencies = ["gtest"]

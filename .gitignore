@@ -9,3 +9,7 @@ target/
 
 # Generated provider scripts are machine-specific (absolute binary path baked in)
 cppkg_provider.cmake
+
+# Disposable upstream clones inside migrations (pin.sh recreates them)
+migrations/*/upstream/
+migrations/*/ref-build/

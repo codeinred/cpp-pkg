@@ -25,5 +25,8 @@ test "$(git -C "$HERE/upstream" describe --tags)" = "$TAG"
 
 # No patches/ to apply: the migration needed zero source-tree edits.
 
+# Stage manifest + lockfile (the lock pins the googletest dev-dependency;
+# with it committed, `cpp-pkg build` of the libraries does no network work).
 cp "$HERE/CppPkg.toml" "$HERE/upstream/CppPkg.toml"
-echo "pinned $URL @ $TAG ($COMMIT); manifest staged at upstream/CppPkg.toml"
+cp "$HERE/CppPkg.lock" "$HERE/upstream/CppPkg.lock"
+echo "pinned $URL @ $TAG ($COMMIT); manifest + lock staged into upstream/"

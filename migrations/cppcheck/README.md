@@ -1,46 +1,40 @@
-# Migration: cppcheck 2.21.1 (CLI)
+# Migration: cppcheck 2.21.1 (CLI + tests) — wave-2 edition
 
 - Upstream: https://github.com/danmar/cppcheck
 - Ref: tag `2.21.1` = commit `904cfdcf774c44b17db789c8a212e2f1c69fc833`
-- Scope: the `cppcheck` CLI binary and its runtime data (cfg/platforms/addons).
-  The Qt GUI is deliberately **out of scope** (upstream option `BUILD_GUI=OFF`
-  by default), not a gap. Tests (`testrunner`) not migrated; see GAPS.md
-  (testing-story).
-- Status: **green** — builds via cpp-pkg only, byte-identical analysis output
-  vs the upstream CMake Release build. No source patches (`patches/` empty).
+- Scope: the `cppcheck` CLI binary, its runtime data (cfg/platforms/addons),
+  and — new this wave — the full upstream ctest suite (85 testrunner
+  fixtures + 27 cfg-* library checks) plus the dev-graph helper tools.
+  The Qt GUI stays deliberately out of scope (`BUILD_GUI=OFF` default).
+- Status: **green** — builds via cpp-pkg only; byte-identical analysis
+  output vs a fresh upstream CMake Release reference build; **exact
+  warning-profile parity** (31 warnings, same buckets, both builds);
+  112/112 `cpp-pkg test` invocations pass; installed prefix runs
+  standalone. One new wave-1 tool bug found in `cpp-pkg install`
+  (closure over-staging; workaround in the manifest — see GAPS.md).
 
-## What the project is
+## What changed since wave 1
 
-A ~86 kLOC C++11 static analyzer: 71 sources in `lib/` (the analysis core),
-11 in `cli/`, one in `frontend/`, plus three vendored externals
-(`simplecpp`, `tinyxml2` compiled; `picojson` header-only). No external
-package dependencies in the default build. At runtime it loads `cfg/*.cfg`
-library definitions and `platforms/*.xml` relative to the executable (or a
-compiled-in `FILESDIR`).
+Every wave-1 workaround this project carried is now real syntax; the
+manifest grew from "the CLI, projected onto macOS, minus everything
+upstream's build actually does" to a faithful port:
 
-## Migration approach
+| wave-1 state | now |
+|---|---|
+| `stage-data.sh` (documented cp commands) | `runtime-data` on three targets (byte-equal dedupe), staged at build time and installed under `share/cppcheck/` — the script is deleted |
+| `FILESDIR="/usr/local/share/Cppcheck"` hardcoded | `FILESDIR="${install-prefix}/share/cppcheck"` — rebaked per prefix, verified by running from the installed prefix |
+| cli library unreproducible (no glob exclude); cli merged into the exe | `[targets.cli] sources = ["cli/*.cpp", "!cli/main.cpp"]` — the testrunner shares it, exactly like upstream |
+| 4 defines + `cxx-std = 11` repeated on all 5 targets | `[target-defaults]` once |
+| upstream warning policy dropped entirely (~9 stray warnings) | `-Weverything` + curated `-Wno` list under `[flags.cfg.clang]`, GNU list under `[flags.cfg.gcc]`, per-target vendored-code relaxations as target `cfg` flags — warning output now matches upstream's own build 31/31 |
+| ambient Homebrew Boost silently ignored (`USE_BOOST=Off` projection) | `[dependencies.boost] system = true, find-package = "Boost"` — declared, `-isystem`, `HAVE_BOOST` on; lock row is the declaration, not the machine |
+| `HAVE_EXECINFO_H=1` baked as a macOS-only literal | labeled cfg transcriptions (`[flags.cfg.unix]`, `# transcribed:` comments incl. the musl caveat); Linux branches written for S5 |
+| `${CMAKE_THREAD_LIBS_INIT}` dropped | `Threads::Threads` builtin on both executables |
+| tests not migrated | `testrunner` `test = true` + 85 per-fixture `[[run]]` entries; 27 cfg-* checks; helpers (`test-signalhandler`, `test-stacktrace`, `test-sehwrapper`, `dmake`) `dev = true` |
 
-See the header comment in `CppPkg.toml` for the full target mapping. Notable
-decisions:
-
-- **Vendored externals as project targets**: tinyxml2/simplecpp are ordinary
-  `static-library` targets compiling `externals/...` sources in-tree;
-  picojson (upstream INTERFACE lib) becomes a private include dir on its
-  consumers because v0 has no `interface-library` kind.
-- **`cppcheck-core` as a static library, not OBJECT**: upstream builds it as
-  an OBJECT library citing static-initializer check registration; in 2.21.x
-  that comment is stale (`lib/checks.cpp` registers all checks explicitly).
-  Verified empirically: the static-archive build reports the identical 342
-  error ids.
-- **cli merged into the executable**: upstream builds a `cli` static lib from
-  `GLOB *.cpp` minus `main.cpp`; cpp-pkg globs cannot exclude, so `cli/*.cpp`
-  (including main) compiles directly into the exe. Link-equivalent result.
-- **Matchcompiler codegen skipped** (== `-DUSE_MATCHCOMPILER=Off`) and
-  **ambient Boost not used** (== `-DUSE_BOOST=Off`): both are performance-only;
-  behavior verified identical. See GAPS.md.
-- **Runtime data staged by script**: `stage-data.sh` mirrors upstream's
-  `copy_cfg`/`copy_platforms`/`copy_addons`/`remove_unsigned_platforms`
-  post-build custom targets.
+Still deliberately divergent (unchanged, see GAPS.md): matchcompiler
+codegen off (tier-c per-source transform remains deferred; upstream's
+`Verify` mode is the behavior-identity contract), `HAVE_RULES`/PCRE off
+(reserved `pkg-config` field), no PCH.
 
 ## Reproduce
 
@@ -48,44 +42,63 @@ decisions:
 cd /opt/claude/cpp-pkg/migrations/cppcheck
 ./pin.sh                                    # clones upstream, copies CppPkg.toml
 cd upstream
-CPPKG_STORE=/tmp/cppkg-store-cppcheck \
-  /opt/claude/cpp-pkg/target/debug/cpp-pkg build   # release config (default)
-cd .. && ./stage-data.sh
-./upstream/build/cppcheck --version
+export CPPKG_STORE=/tmp/cppkg-store-cppcheck
+
+cpp-pkg build                               # release; data staged next to the
+./build/cppcheck --version                  # binary automatically — no script
+
+cpp-pkg test --jobs 8                       # 85 fixtures + 27 cfg checks
+                                            # (builds testrunner lazily)
+
+cpp-pkg install --prefix /tmp/cppcheck-prefix
+/tmp/cppcheck-prefix/bin/cppcheck --enable=all some.cpp   # FILESDIR lookup
+
+cpp-pkg build test-stacktrace dmake         # dev-graph tools, by name
 ```
 
-First build on an M-series Mac: ~7 s wall (90 ninja edges). Second
-`cpp-pkg build`: `ninja: no work to do.` (0.15 s). The dependency store is
-unused — the default cppcheck build has zero external packages — so the
-"store cache hit on second build" check is vacuous here; incrementality is
-carried entirely by the generated ninja file.
+Cold default build: 226 ninja edges (incl. runtime-data copy edges),
+~12 s wall on this M-series machine under the full `-Weverything` policy.
+Second `cpp-pkg build`: `ninja: no work to do.` `cpp-pkg test` builds 81
+more edges lazily. The dependency store holds only the boost sysdep
+manifest entry (nothing builds — system dep). Note `install --prefix X`
+rebakes `${install-prefix}` into every TU (upstream applies FILESDIR via
+global `add_definitions`, so the faithful port puts it in
+`[target-defaults]`) — a prefix change is a near-full recompile by
+construction.
 
 ## Parity protocol and evidence (2026-08-14, macOS arm64, Apple clang 21)
 
-Upstream reference: fresh `cmake -G Ninja -DCMAKE_BUILD_TYPE=Release` +
-`ninja cppcheck` (matchcompiler ON via Auto, Homebrew Boost 1.90 auto-detected
-by upstream — both performance-only).
+Reference: fresh `cmake -G Ninja -DCMAKE_BUILD_TYPE=Release` + `ninja
+cppcheck copy_cfg copy_platforms copy_addons` from the same pin
+(matchcompiler ON via Auto, Boost auto-detected — both perf-only).
 
-1. `cppcheck --version` → `Cppcheck 2.21.1` (both).
-2. `cppcheck --errorlist` → byte-identical XML, 342 `<error id=` entries
-   (proves every checker registered).
-3. `fixture/bugs.cpp` (deliberate bugs: uninitvar, malloc leak,
-   array OOB, null deref, zerodiv, vector OOB) with
-   `--enable=all --inconclusive --template={file}:{line}:{severity}:{id}:{message}`
-   → 20 findings, byte-identical diff (includes cfg-dependent checks:
-   `memleak`/`nullPointerOutOfMemory` require `std.cfg` to resolve `malloc`,
-   proving runtime-data lookup works).
-4. `--platform=avr8 --enable=portability` → identical (proves file-based
-   `platforms/*.xml` lookup relative to the exe).
-
-A third build variant (naive port with frontend+cli merged differently) also
-matched byte-for-byte, so the result is layout-insensitive.
+1. `--version` → `Cppcheck 2.21.1` (both).
+2. `--errorlist` → **byte-identical** XML, 342 `<error id=` entries.
+3. `fixture/bugs.cpp` with `--enable=all --inconclusive
+   --template={file}:{line}:{severity}:{id}:{message}` → 21 lines,
+   **byte-identical** (includes cfg-dependent `memleak` /
+   `nullPointerOutOfMemory`, proving `std.cfg` resolution).
+4. `--platform=avr8 --enable=portability` → **byte-identical** (file-based
+   platform XML lookup).
+5. New this wave — warning parity: both builds emit exactly 31 compiler
+   warnings: 28 `-Wthread-safety-negative` + 1
+   `-Wreserved-macro-identifier` (+2 notes). The transplanted
+   `-Weverything` policy is upstream's to the warning.
+6. New this wave — install: `cpp-pkg install --prefix <scratch>`, then run
+   `<scratch>/bin/cppcheck` from an unrelated cwd: cfg-dependent findings
+   and `--platform=avr8` both resolve via the baked FILESDIR (the
+   build-tree copy is out of reach). `--destdir` untested here.
+7. `cpp-pkg test --jobs 8`: **112 passed, 0 failed** (85 fixtures + 27
+   cfg checks; `TestSymbolDatabase` spot-checked standalone).
 
 ## Files
 
-- `CppPkg.toml` — the manifest (source of truth; `pin.sh` copies it into the
-  checkout).
+- `CppPkg.toml` — the manifest (source of truth; `pin.sh` copies it into
+  the checkout). Header comments map every target to its upstream
+  CMakeLists origin; `# transcribed:` comments label configure-time
+  answers per the wave-1 convention.
 - `pin.sh` — clone upstream at the pinned commit, stage the manifest.
-- `stage-data.sh` — copy cfg/platforms/addons next to the built binary.
 - `fixture/bugs.cpp` — parity fixture.
-- `GAPS.md` — friction points found, keyed to the design questions.
+- `GAPS.md` — wave-2 edition: dissolved workarounds and what honestly
+  remains (including new bugs found in the wave-1 features).
+- `stage-data.sh` — **deleted** (dissolved into `runtime-data`).

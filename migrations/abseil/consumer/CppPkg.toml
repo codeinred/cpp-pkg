@@ -1,28 +1,27 @@
 # Consumption-side experiment: abseil as an ordinary cpp-pkg dependency.
 # Exercises the tier-2 probe at scale (217 imported absl::* components).
 #
-# TWO workarounds baked in (details in ../GAPS.md):
-#  1. Dep key MUST be "absl", not "abseil": the probe runs
-#     find_package(<depkey>) and there is no field to override the CMake
-#     package name (abslConfig.cmake).
-#  2. The dep source is a LOCALLY PATCHED clone (see ../patches/): upstream's
+# Wave-2 edition — both wave-1 workarounds are gone:
+#  1. The dep key no longer has to equal the CMake package name: the key is
+#     "abseil" and `find-package = "absl"` names abslConfig.cmake (wave-1
+#     tool-fix batch documents the field; the probe uses it).
+#  2. The dep is plain upstream truth: no locally patched clone. Upstream's
 #     installed export gives absl::strings a self-edge in
-#     INTERFACE_LINK_LIBRARIES, which cpp-pkg rejects as a dependency cycle.
-#     cpp-pkg has no way to patch a dependency, so pin.sh prepares the
-#     patched repo and substitutes its absolute path for @ABSL_PATCHED_REPO@.
-#     (Unpatched equivalent: git = "https://github.com/abseil/abseil-cpp",
-#     tag = "20260526.0" — fails with "dependency cycle in link closure".)
+#     INTERFACE_LINK_LIBRARIES; since wave 1 self-link edges are deduped as
+#     no-ops (CMake's own semantics), so unpatched 20260526.0 just works
+#     and the lockfile is committable from any machine.
 schema-version = 1
 
 [package]
 name = "abseil-consumer"
 version = "0.1.0"
 
-[dependencies.absl]
-git = "file://@ABSL_PATCHED_REPO@"
-tag = "20260526.0-cppkg1"
+[dependencies.abseil]
+git = "https://github.com/abseil/abseil-cpp"
+tag = "20260526.0"
+find-package = "absl"
 
-[dependencies.absl.options]
+[dependencies.abseil.options]
 ABSL_ENABLE_INSTALL = "ON"
 ABSL_PROPAGATE_CXX_STD = "ON"
 ABSL_BUILD_TESTING = "OFF"

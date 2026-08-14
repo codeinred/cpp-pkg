@@ -15,14 +15,8 @@ fi
 git -C upstream fetch --quiet origin "$COMMIT"
 git -C upstream checkout --quiet "$COMMIT"
 
-# --- codegen workaround (GAP: codegen-escape-hatch) -----------------------
-# Upstream: configure_file(src/version.hpp.in -> ${BINARY_DIR}/src/version.hpp)
-# substituting @CMAKE_PROJECT_VERSION@. cpp-pkg has no generation step, so we
-# pre-generate the header into gen/src/ (listed as a private include dir).
-# The version string is duplicated here and in CppPkg.toml [package].version.
-mkdir -p upstream/gen/src
-sed 's/@CMAKE_PROJECT_VERSION@/1.4.2/' \
-  upstream/src/version.hpp.in > upstream/gen/src/version.hpp
+# (The wave-1 sed pre-generation of gen/src/version.hpp is gone: version.hpp
+# is now a [generate] template step; cpp-pkg renders it under build/gen/.)
 
 # The checked-in manifest is the source of truth; copy it beside the sources
 # (plus the resolved lockfile, so a fresh machine reuses the exact pins).

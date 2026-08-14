@@ -1,136 +1,133 @@
-# Gaps found migrating googletest v1.18.0
+# Gaps — googletest v1.18.0, wave-2 edition
 
-Both consumption modes worked end-to-end; every gap below had a documented
-workaround or was cosmetic. Ordered by severity within each lens.
+Re-migration against the wave-1 extensions (2026-08-14). Status: **green** —
+build, `cpp-pkg test`, install/export fixpoint, and store cache hit all
+verified. Wave-1 gap numbers referenced as W1-#.
 
-## testing-story (the sharpest data from this project)
+## Dissolved (workaround → feature)
 
-### 1. No `cpp-pkg test` — tests are just executables you remember to run (major)
+- **W1-1 (no `cpp-pkg test`)** → `test = true` on the 10 samples +
+  `cpp-pkg test`. The shell for-loop and hand-aggregated exit codes are
+  gone: one command builds and runs the suite, `10 passed, 0 failed`
+  summary, `--list`, name filters, `-- --gtest_*` passthrough (verified),
+  `--jobs`. A filter matching nothing is the promised hard error listing
+  all test targets.
+- **W1-2 (no dev-dependencies)** → consumer moved googletest to
+  `[dev-dependencies]`. `cpp-pkg build` of the consumer does zero store
+  work ("no targets to build"); the dep is locked eagerly (CppPkg.lock row
+  unchanged in grammar) and fetched/built only by `cpp-pkg test`. The
+  public dependency set of a library consumer is clean again.
+- **W1-3 (option-gated samples build for everyone)** → subsumed by the test
+  markers exactly as wave 1 predicted: `cpp-pkg build` is now 4 libraries /
+  8 ninja steps; the samples build only under `cpp-pkg test`. Upstream's
+  `-Dgtest_build_samples=ON` gate needed no features/options machinery.
+- **W1-5 (a cpp-pkg-built package cannot be published)** →
+  `[export] cmake-name = "GTest", namespace = "GTest"` +
+  `[target-defaults] install = true` + `cpp-pkg install --prefix`. Emits
+  `lib/*.a`, the exact upstream header set (38 files, byte-identical set to
+  `googletest/include` + `googlemock/include`), `GTestConfig.cmake`,
+  `GTestConfigVersion.cmake` (SameMajorVersion, `find_package(GTest 1.18)`
+  accepted), and `cppkg-manifest.json`. Fixpoint verified: a raw CMake
+  consumer builds and passes against our emission — adopting CppPkg.toml no
+  longer orphans the `find_package(GTest)` ecosystem. The
+  `public-headers` total override keeps `googletest/` (the source dir,
+  public for `#include "src/gtest.cc"` and upstream interface parity) out
+  of the installed set — exactly the split upstream expresses with
+  `$<BUILD_INTERFACE:...>` vs `$<INSTALL_INTERFACE:include>`.
+- **W1-7 (no per-target flags; upstream warning sets dropped)** →
+  `[flags.cfg.clang]`/`[flags.cfg.gcc]` carry `cxx_base_flags` (+
+  `-fexceptions`, i.e. upstream's `cxx_default`, all targets);
+  `cxx_strict_flags` are private per-target `cxx-flags` under
+  `cfg.clang`/`cfg.gcc` on the 4 libraries only — upstream's scoping, line
+  for line, including the gcc branch (`-Wextra -Wno-unused-parameter
+  -Wno-missing-field-initializers`, `-Wno-error=dangling-else`) written now
+  for Linux validation. Bonus: cpp-pkg's `clang` matches AppleClang, so
+  the strict set actually *applies* here (0 warnings emitted, verified via
+  `-fsyntax-only`), where upstream's `STREQUAL "Clang"` footgun compiled
+  warning-free by accident. Same artifacts, honest diagnostics.
+- **W1-8 (no SYSTEM interface includes)** → `system-includes = true` on the
+  4 libraries: sample compile lines show `-isystem <...>/googletest/include
+  -isystem <...>/googletest`, matching upstream's
+  `target_include_directories(... SYSTEM INTERFACE ...)`.
+- **W1-9 (`find-package` undocumented)** → documented in CPPKG_TOML.md
+  (wave-1 tool fix 4); the consumer's comment now cites the doc instead of
+  src/schema.rs.
+- **W1-10 (`cxx-std = 17` × 14)** → `[target-defaults] cxx-std = 17`, once.
+  The silent-default hazard (forgetting one target) is gone; the exported
+  Config carries `cxx_std 17` per component like upstream's PUBLIC compile
+  feature.
+- **W1-11 (absorbed `Threads::Threads`)** → builtin. The libraries now
+  declare the upstream PUBLIC `Threads::Threads` edge (previously dropped);
+  it expands to nothing on macos, `-pthread` on linux — upstream's
+  effective behavior — and the emitted Config reproduces upstream's
+  `find_dependency(Threads)` + `INTERFACE_LINK_LIBRARIES Threads::Threads`
+  shape exactly. No `exposes-*` tie-breaking needed anywhere.
 
-Mode (a), in-tree: the 10 sample tests are ordinary `executable` targets.
-Building them is fine; *running* them is `for i in $(seq 1 10);
-build/sample${i}_unittest; done` by hand, with the user aggregating exit
-codes. There is no runner, no pass/fail summary across binaries, no
-`--gtest_filter` passthrough, no parallelism, no "which targets are tests"
-marking. Upstream gets all of this from CTest (`enable_testing()` +
-`ctest`). Minimal v1 shape suggested by this migration: a `[targets.X]
-test = true` marker (or `type = "test"`) + `cpp-pkg test [filter]` that
-builds marked targets and runs them with per-binary and aggregate reporting.
-GoogleTest binaries already exit non-zero on failure and self-report; the
-runner only needs spawn/collect.
+## Remaining
 
-### 2. No test-only/dev dependencies (major)
+### 1. Platform-conditional default define inexpressible: `[target-defaults.cfg.*]` reserved (minor)
 
-Mode (b): the consumer declares googletest in plain `[dependencies]`. For a
-library project this poisons the public dependency set — there is no
-`[dev-dependencies]`, so a downstream consumer of the library would resolve
-(and possibly build) googletest. Cargo users will reach for
-`[dev-dependencies]` on day one.
+Upstream computes `GTEST_HAS_PTHREAD=1|0` once (pthreads found?) and folds
+it into `cxx_base_flags` for *every* target. The natural spelling —
+`[target-defaults.cfg.unix] defines = ...` — is reserved. Choices: 14
+per-target `cfg.unix` blocks (recreating the repetition B9 exists to kill)
+or one unconditional default. This port chose the unconditional default
+(correct on macos/linux; wrong for a future Windows toolchain, where
+upstream defines `=0`). First concrete case for un-reserving
+`[target-defaults.cfg.*]`, or for a package-scope conditional defines home.
 
-### 3. No option-gated targets (major; also conditional-sources)
+### 2. Strict-flag set repeated 8 times (minor, ergonomics)
 
-Upstream builds samples only under `-Dgtest_build_samples=ON` and its own
-test suite under `-Dgtest_build_tests=ON`. `CppPkg.toml` has no
-options/features, so all 10 samples build unconditionally for every user of
-this manifest. Workaround: accept the extra ~10 targets (cheap here); a real
-project with heavy test suites cannot. A tests marker (gap 1) that builds
-test targets only under `cpp-pkg test` would subsume most of this;
-Cargo-style `[features]` is the general fix.
+`cxx_strict_flags` applies to the 4 libraries but not the samples — an
+environment statement over a *subset* of targets. `[flags]` hits every
+target; flag keys in `[target-defaults]` are reserved (pointing at
+`[flags]`, which is the wrong scope here); so the 11-flag clang list and
+3-flag gcc list are pasted into 4 targets × 2 compilers = 8 cfg blocks.
+Upstream writes each set once (`cxx_strict` variable). Wants either named
+flag sets or `[target-defaults]` flag keys with dev/test eligibility rules.
 
-### 4. Mode (a) vs mode (b) asymmetry
+### 3. compile_commands.json reflects only the last requested build set (minor, NEW wave-1 behavior)
 
-In-tree consumption references bare target names (`gtest_main`); GIT-dep
-consumption references `GTest::gtest_main` and needed `find-package =
-"GTest"` + a full CMake configure+build+install+probe (~minutes on first
-build). Same code, two different names and cost profiles. Fine as v0
-architecture, but a future `path`-dep or "workspace member" form should make
-an in-tree package consumable under its exported names so test code doesn't
-change when a library is split out.
+After `cpp-pkg test sample7_unittest`, `build/compile_commands.json`
+shrinks to 3 entries (gtest-all, gtest_main, sample7) — the default build's
+entries are gone until the next `cpp-pkg build`/full `test`. Laziness of
+the test-set plan leaks into the tooling surface: clangd loses flags for
+every file outside the last-requested set. Accumulate/merge per target
+rather than regenerate per invocation.
 
-## install-export
+### 4. MSVC branch not transcribed (deliberate; blocked on options)
 
-### 5. A cpp-pkg-built package cannot be published to anyone (major)
+Upstream's MSVC path is more than flags: CRT selection
+(`MultiThreaded$<$<CONFIG:Debug>:Debug>`) is gated on the
+`gtest_force_shared_crt` *option*, which has no cpp-pkg expression, and the
+base set (`-GS -W4 -wd4251 ... -D_UNICODE -DUNICODE ...`) mixes flags with
+defines that the schema wants in `defines`. Left as a header comment;
+Windows toolchains are out of v1 scope anyway. Becomes real work if/when a
+windows toolchain lands.
 
-The migrated build produces `libgtest.a` etc. in `build/`, but there is no
-`cpp-pkg install`/export: no header staging, no manifest/Config emission for
-*own* targets (the shim emitter only serves CMake-*extracted* manifests).
-Consequence: if googletest itself adopted CppPkg.toml, its entire ecosystem
-(CMake `find_package(GTest)`, cpp-pkg GIT deps, pkg-config users) would lose
-their consumption path — mode (b) works today only because upstream's CMake
-build still exists to install `GTestConfig.cmake`. The IR is already
-manifest-shaped; emitting `cppkg-manifest.json` + a Config shim from local
-`[targets]` looks like the natural closing of the loop (the round-trip
-fixpoint idea in CLAUDE.local.md).
+### 5. Mode (a)/(b) asymmetry persists, now narrower (minor; W1-4)
 
-### 6. Versioned-archive property not expressible (minor)
+In-tree test code references `gtest_main`; consumer code references
+`GTest::gtest_main`. The export story removed the *publishing* half of
+W1-4, but a cpp-pkg GIT dep still builds through the dependency's CMake
+build — googletest-as-dep works only because upstream's CMakeLists.txt
+still exists. A CppPkg.toml-only package is installable (verified) but not
+yet consumable as a cpp-pkg GIT dependency; `path`/workspace deps remain
+unimplemented (recorded intent in CPPKG_TOML.md).
 
-Upstream sets `VERSION ${GOOGLETEST_VERSION}` on the libraries and installs
-pkg-config files (`gtest.pc`). No observable difference for static archives
-on macOS, but an install story will need somewhere to put version metadata
-per artifact.
+### 6. Per-artifact version metadata / pkg-config (minor; W1-6, recorded loss)
 
-## per-target-flags
+Upstream sets `VERSION` on the archives and installs `gtest.pc` etc.
+`.pc` emission is explicitly out of wave-1 scope ("out of scope,
+honestly"). Unchanged.
 
-### 7. No per-target compile flags (major in general, moot on this machine)
+## Notes for S5 (Linux validation)
 
-Upstream compiles the four libraries with a strict warning set (`-Wall
--Wshadow -Wconversion -Wundef -W -Wpointer-arith -Wcast-qual ...`) and
-samples with a milder set — per-target `COMPILE_FLAGS`. cpp-pkg offers only
-profile-level flags (all consumer targets uniformly). Workaround: drop the
-warning flags entirely; no artifact/behavior change. Amusing evidence for
-"warnings are per-target, not per-project": upstream's own branches test
-`CMAKE_CXX_COMPILER_ID STREQUAL "Clang"`, which AppleClang fails, so the
-reference CMake build *also* compiled warning-free here — parity by
-accident. A `cxx-flags = [...]` key under `[targets.X]` (private-only, like
-Cargo's per-target rustflags absence suggests keeping it simple) would have
-covered this exactly. On GCC/Linux the migration would silently lose
-upstream's `-Wextra` set — same artifacts, different diagnostics.
-
-### 8. No SYSTEM interface includes (minor)
-
-Upstream exports its include dirs with `SYSTEM INTERFACE` so consumers'
-aggressive warnings don't fire inside gtest headers. cpp-pkg emits plain
-`-I` for sibling-target public includes. Invisible until per-target warnings
-(gap 7) exist; when they do, public includes of dependencies should probably
-become `-isystem`.
-
-## schema-ergonomics
-
-### 9. `find-package` exists but is undocumented (major, docs-only)
-
-First consumer build failed: probe ran `find_package(googletest)` while
-upstream installs `GTestConfig.cmake`. The fix — `find-package = "GTest"` on
-the dependency — exists in the implementation (`src/schema.rs`: "find_package
-name used by the probe; defaults to the dep key") but appears nowhere in
-CPPKG_TOML.md. The error message does hint at it (cli.rs suggests
-`find-package = ...`), but only in the provider-mode path; the probe-failure
-error I hit was raw CMake "Could not find a package configuration file".
-Two fixes: document the field, and translate the probe's config-file-not-
-found error into the same actionable hint.
-
-### 10. `cxx-std` does not propagate; repeated 14 times (minor)
-
-Upstream declares `cxx_std_17` as a PUBLIC compile feature once; every
-consumer inherits it. In CppPkg.toml each of the 14 targets carries
-`cxx-std = 17`, and forgetting one produces a working-by-luck build at the
-toolchain default std. Wants either a `[package] cxx-std = 17` default or
-public propagation of a library's cxx-std to dependents (max over the
-closure, the CMake compile-features model).
-
-## dep-provisioning
-
-### 11. find-module targets absorbed into the package manifest (minor, worked)
-
-`GTestConfig.cmake` runs `find_dependency(Threads)`; the probe's
-IMPORTED_TARGETS diff attributes `Threads::Threads` to the googletest
-package, and the store manifest exports it as a `GTest` component with empty
-interface (macOS: threads are in libSystem). Harmless here — but on Linux
-`Threads::Threads` carries `-pthread`, and if two packages both absorb it,
-namespace-attribution (ladder step 3) may need the user to break the tie for
-a target no one really "owns". System find-modules (Threads, and eventually
-OpenSSL/ZLIB find-module fallbacks) may deserve a builtin-recognized list.
-
-## codegen-escape-hatch / object-libraries
-
-Not exercised: googletest has no generated sources and no object libraries.
-No data from this migration.
+- `[flags.cfg.gcc]` + per-lib `cfg.gcc` strict flags are transcriptions of
+  upstream's `CMAKE_COMPILER_IS_GNUCXX` branch (gcc ≥ 7 form, incl.
+  `-Wno-error=dangling-else`); expect them to fire under gcc 16 — any
+  unknown-warning failure there is data, not expected.
+- `Threads::Threads` must expand to `-pthread` on compile and link of all
+  four libraries and every sample.
+- `GTEST_HAS_PTHREAD=1` is unconditional by choice (Remaining #1) —
+  correct on Linux.

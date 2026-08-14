@@ -2,7 +2,24 @@
 schema-version = 1
 
 [[package]]
+name = "googletest"
+source = "git+https://github.com/google/googletest"
+requested = "rev:58d77fa8070e8cec2dc1ed015d66b454c8d78850"
+commit = "58d77fa8070e8cec2dc1ed015d66b454c8d78850"
+
+[[package]]
 name = "libdwarf"
 source = "git+https://github.com/jeremy-rifkin/libdwarf-lite"
 requested = "rev:5dfb2cd2aacf2bf473e5bfea79e41289f88b3a5f"
 commit = "5dfb2cd2aacf2bf473e5bfea79e41289f88b3a5f"
+
+[[package]]
+name = "zlib"
+source = "system"
+requested = "system"
+
+[[package]]
+name = "zstd"
+source = "url+https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz"
+requested = "sha256:eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3"
+content-hash = "blake3:730dca31244abd219e995f03a55d95b2cfb4b3e16cda055a79fa6f30a4f0e1db"

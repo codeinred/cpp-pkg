@@ -1,90 +1,111 @@
-# Migration: google/benchmark v1.9.5
+# Migration: google/benchmark v1.9.5 — wave-2 edition
 
 - Upstream: https://github.com/google/benchmark
 - Ref: tag `v1.9.5` = commit `192ef10025eb2c4cdd392bc502f0c852196baa48`
 - Machine: macOS arm64, AppleClang 21, cmake 4.4, ninja
-- Status: **green** in both modes, zero patches, several documented gaps
-  (`GAPS.md`).
+- Status: **green** in both modes, zero patches, **full test suite ported**
+  (84/84 invocations pass, matching the reference CTest run 1:1). Dissolved
+  vs. remaining gaps: `GAPS.md`.
 
 Google Benchmark is a microbenchmark library: two static libraries
 (`benchmark`, `benchmark_main`), a heavily configure-time-driven CMake build
 (git-describe version stamping, `cxx_feature_check` try_run probes, warning
 flag probing via `add_cxx_compiler_flag`), a gtest-based test suite, and a
-full install/export story (headers, `benchmarkConfig.cmake`, pkg-config
-files, python tools).
+full install/export story. Wave 1 ported the two libraries as a macOS-only
+projection and cut the suite and the install story; wave 2 restores all of
+it as real schema surface.
 
 ## What was migrated
 
-Two modes, both exercised:
-
-1. **Build-from-source** (`CppPkg.toml`, staged into the upstream root by
-   `pin.sh`): targets `benchmark` (19 explicit `.cc` files — upstream's
-   glob-minus-benchmark_main.cc), `benchmark_main`, and `basic-bench`
-   (upstream's own `test/basic_test.cc`, which ends in `BENCHMARK_MAIN()` and
-   needs no gtest) as the proof executable.
-2. **Declare-as-dependency** (`consumer/`): a `bench-demo` executable
-   consuming `benchmark::benchmark_main` via the normal cpp-pkg pipeline
-   (git dep → CMake build into store → tier-2 probe of the installed
-   `benchmarkConfig.cmake`). The installed `benchmark::*` targets are real
-   IMPORTED targets (not ALIASes, unlike curl), so the probe sees them
-   directly; `find_dependency(Threads)` resolves via CMake's find-module and
-   needed no `needs` entry.
+1. **Build-from-source** (`CppPkg.toml` + `CppPkg.lock`, staged into the
+   upstream root by `pin.sh`):
+   - `benchmark` / `benchmark_main` (`install = true` via `[target-defaults]`
+     eligibility — dev/test targets skip it automatically);
+   - sources as upstream's own shape: `["src/*.cc", "!src/benchmark_main.cc"]`;
+   - warning battery in `[flags]` with the clang-only members
+     (`-Wshorten-64-to-32`, `-Wthread-safety`) under `[flags.cfg.clang]`;
+   - probe results as `cfg` transcriptions (`# transcribed:` comments):
+     Linux branch (`BENCHMARK_HAS_PTHREAD_AFFINITY`, `-lrt`) and Windows
+     branch (`shlwapi.lib`) written from upstream's build logic, validated
+     but inactive here (S5 exercises Linux);
+   - `BENCHMARK_VERSION="v${package.version}"` interpolated define;
+   - `Threads::Threads` builtin edge (upstream's PRIVATE link, dropped in
+     wave 1);
+   - **the whole test suite**: googletest as `[dev-dependencies]` (upstream's
+     own bundled pin v1.15.2, `find-package = "GTest"`), `output_test_helper`
+     as `dev = true` library, 49 `test = true` executables, 84 `[[run]]`
+     entries transcribed from upstream's CTest registrations (36 of them the
+     `filter_test` matrix), per-target overrides (`donotoptimize_test`
+     `-O3 -Werror=deprecated-declarations`, `cxx11_test` `cxx-std = 11`).
+2. **Declare-as-dependency** (`consumer/`): unchanged manifest; `bench-demo`
+   consumes `benchmark::benchmark_main` via git dep → CMake store build →
+   probe of the installed `benchmarkConfig.cmake`.
 
 ## Scope reductions (explicit)
 
-- The gtest test suite (~40 CTest tests) is **not** migrated: cpp-pkg has no
-  test targets, test-only dependencies, or runner (GAPS: testing-story).
-  Equivalent of `BENCHMARK_ENABLE_TESTING=OFF`.
-- The install/export payload (headers, config files, `.pc` files, tools) is
-  **not** produced by the source-mode build: cpp-pkg has no install story
-  (GAPS: install-export).
-- The manifest encodes the macOS/arm64/AppleClang configure outcome only
-  (feature-probe defines, no `rt`/`shlwapi`/`kstat`); it is not portable
-  (GAPS: conditional-sources, codegen-escape-hatch).
+- `.pc` files (`benchmark.pc`, `benchmark_main.pc`), python tools
+  (`share/googlebenchmark/tools`) and docs installs: out of scope for
+  `cpp-pkg install` (recorded loss, spec'd as such).
+- Assembly tests: upstream itself gates them off here (x86_64 + FileCheck
+  required; this machine is arm64).
+- Solaris `kstat`: out of the cfg vocabulary (comment in the manifest).
+- The test stanzas transcribe upstream's **non-Debug** branch (`-UNDEBUG` +
+  `TEST_BENCHMARK_LIBRARY_HAS_NO_ASSERTIONS`); a debug-config test build
+  differs from upstream there (profile-conditional defines are not
+  expressible — see GAPS).
 
 ## Reproduce
 
 ```sh
 cd migrations/benchmark
 ./pin.sh
-cd upstream && CPPKG_STORE=/tmp/store cpp-pkg build && ./build/basic-bench
+cd upstream
+CPPKG_STORE=/tmp/store cpp-pkg build          # the two libraries only
+CPPKG_STORE=/tmp/store cpp-pkg test           # fetches gtest (dev-dep, lazy),
+                                              # builds 49 test targets, runs
+                                              # 84 invocations
+CPPKG_STORE=/tmp/store cpp-pkg install --prefix /tmp/prefix
 cd ../consumer && CPPKG_STORE=/tmp/store cpp-pkg build && ./build/bench-demo
 ```
 
 ## Parity protocol and evidence
 
 Reference build: fresh `cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
--DBENCHMARK_ENABLE_TESTING=OFF` + install of the same checkout.
+-DBENCHMARK_DOWNLOAD_DEPENDENCIES=ON` (testing **ON** this wave — the only
+library-flag difference vs. wave 1's testing-OFF reference is upstream adding
+`-Wsuggest-override` when testing is off, which this manifest therefore
+omits).
 
-- **Object files bit-identical**: `cmp` of `benchmark.cc.o` and
-  `sysinfo.cc.o` from the CMake build vs the cpp-pkg build — identical bytes.
-  Archives (`libbenchmark.a`, `libbenchmark_main.a`) have identical sizes
-  (598176 / matching) and identical `nm -g` symbol lists (625 exported
-  symbols); the archives differ only in `ar` member metadata.
-- **Flags matched by construction**: profile `cxx-flags` reproduce the
-  reference `build.ninja` FLAGS line exactly (same warning battery,
-  `-fvisibility=hidden -fvisibility-inlines-hidden`, `-O3 -DNDEBUG
-  -std=c++17`), plus one added suppression (`-Wno-unused-but-set-variable`)
-  needed because flags cannot be scoped to the test TU (documented deviation;
-  suppression only, object code unchanged — proven by the bit-identical
-  objects, which don't include the test TU).
-- **Version string**: `BENCHMARK_VERSION="v1.9.5"` hardcoded; embedded string
-  in `benchmark.cc.o` and `--benchmark_format=json` `library_version` both
-  report `v1.9.5`, matching the reference (which got it via `git describe`).
-- **Runtime**: `basic-bench` runs and prints timings (e.g. `BM_empty
-  0.341 ns`); consumer `bench-demo` built via cpp-pkg vs the same source
-  built via plain CMake `find_package(benchmark)` against the CMake install:
-  `--benchmark_list_tests` output identical, timings within noise, both
-  report `library_version: v1.9.5`.
-- **Store determinism**: second consumer build is a full store cache hit (no
-  dependency rebuild, `ninja: no work to do`); source-mode rebuild is a
-  no-op.
+- **Object files bit-identical**: `cmp` of `benchmark.cc.o`, `sysinfo.cc.o`,
+  `benchmark_register.cc.o`, `timers.cc.o`, `benchmark_main.cc.o` from the
+  reference vs. the cpp-pkg build — identical bytes, although the manifest
+  now splits the battery across `[flags]`/`[flags.cfg.clang]` (flag order
+  differs; codegen doesn't). `benchmark.cc.o` embeds the interpolated
+  version string, so `${package.version}` reproduced `git describe` exactly.
+- **Symbol lists**: `nm -g` of `libbenchmark.a` identical (811 names).
+- **Test parity**: reference `ctest` = 84 tests, 100% pass; `cpp-pkg test` =
+  the same 84 invocations (names and argv transcribed 1:1), 84 passed / 0
+  failed. `cpp-pkg test filter_test` runs the 36-entry matrix alone; a
+  non-matching filter hard-errors listing all 49 targets.
+- **Install**: 7 files staged (2 archives, 2 headers, Config +
+  SameMajorVersion ConfigVersion + cppkg-manifest.json). **Fixpoint test
+  from wave-1 GAPS now passes**: a plain CMake project's
+  `find_package(benchmark 1.9.5 REQUIRED)` against the cpp-pkg-installed
+  prefix configures, links `benchmark::benchmark_main`, runs, and reports
+  `library_version: v1.9.5`.
+- **Store determinism**: second `cpp-pkg build` and `cpp-pkg test` are
+  no-ops (`ninja: no work to do`, no store work); second consumer build is a
+  full cache hit.
+- **Laziness**: `cpp-pkg build` of the libraries locks googletest eagerly
+  (it is in `CppPkg.lock`) but never fetches or builds it; only
+  `cpp-pkg test` provisions it.
 
 ## Files
 
 - `CppPkg.toml` — source-mode manifest (source of truth; `pin.sh` stages it)
+- `CppPkg.lock` — lockfile incl. the googletest dev-dep pin (staged too)
 - `consumer/CppPkg.toml`, `consumer/src/main.cc`, `consumer/CppPkg.lock` —
   dependency-mode consumer
-- `pin.sh` — pins the upstream checkout
-- `patches/` — empty by design (no source edits needed)
-- `GAPS.md` — friction points keyed to the design questions
+- `pin.sh` — pins the upstream checkout, stages manifest + lock
+- `patches/` — empty by design (no source edits needed, either wave)
+- `GAPS.md` — wave-2 edition: dissolved workarounds and what remains

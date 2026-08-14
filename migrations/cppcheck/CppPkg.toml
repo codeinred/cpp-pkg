@@ -1,41 +1,52 @@
-# cpp-pkg port of cppcheck 2.21.1 — CLI binary only (GUI/Qt out of scope).
+# cpp-pkg port of cppcheck 2.21.1 — CLI + testrunner (GUI/Qt out of scope).
+# Wave-2 edition: rewritten for the wave-1 schema (cfg, [flags], [target-defaults],
+# glob "!", runtime-data, install, dev/test + [[run]], system deps, builtins).
 #
 # Target mapping vs upstream CMake:
-#   tinyxml2 (static)        -> [targets.tinyxml2]        (vendored, compiled in-tree)
-#   simplecpp (static)       -> [targets.simplecpp]       (vendored, compiled in-tree)
-#   picojson (INTERFACE)     -> no interface-library kind in v0; folded into
-#                               consumers' private include dirs
-#   cppcheck-core (OBJECT)   -> [targets.cppcheck-core] as static-library.
-#                               Upstream's OBJECT-library comment ("auto-
-#                               registration doesn't work with static
-#                               libraries") is STALE in 2.21.x: lib/checks.cpp
-#                               registers every check explicitly, so a static
-#                               archive is correct (verified: --errorlist is
-#                               byte-identical to the CMake build, 342 ids).
+#   tinyxml2 (static)        -> [targets.tinyxml2]   (vendored, compiled in-tree)
+#   simplecpp (static)       -> [targets.simplecpp]  (vendored, compiled in-tree)
+#   picojson (INTERFACE)     -> still no interface-library kind; folded into
+#                               consumers' private include dirs (unchanged gap)
+#   cppcheck-core (OBJECT)   -> static-library (upstream's OBJECT rationale is
+#                               stale in 2.21.x: lib/checks.cpp registers every
+#                               check explicitly; verified byte-identical
+#                               --errorlist in wave 1)
 #   frontend (static)        -> [targets.frontend]
-#   cli (static) + cppcheck  -> merged into [targets.cppcheck]: upstream
-#     (exe = main.cpp)          builds the cli lib from GLOB *.cpp minus
-#                               main.cpp (list(REMOVE_ITEM)); cpp-pkg globs
-#                               have no exclude form, so cli sources + main
-#                               are compiled straight into the executable.
+#   cli (static)             -> [targets.cli] — NOW REPRODUCIBLE:
+#                               sources = ["cli/*.cpp", "!cli/main.cpp"]
+#   cppcheck (exe)           -> [targets.cppcheck] = cli/main.cpp + cli lib,
+#                               Threads::Threads builtin, runtime-data staged
+#                               at build time (stage-data.sh deleted)
+#   testrunner (exe)         -> [targets.testrunner] test = true; 85 [[run]]
+#                               entries = upstream's per-fixture ctest set
+#   cfg-* ctest entries      -> [targets.cppcheck-cfg-test]: run entries can
+#                               only spawn their OWN target's binary, so the
+#                               28 cfg tests (which invoke the product binary)
+#                               need a duplicate one-TU executable. See GAPS.
+#   test/signal, test/seh    -> dev = true helper executables
+#   tools/dmake              -> dev = true (EXCLUDE_FROM_ALL upstream);
+#                               run-dmake's source-tree Makefile refresh has
+#                               no [generate] home (output isn't consumed by
+#                               this build) — not modeled
 #
-# Fidelity notes (deliberate, behavior-neutral divergences from the default
-# upstream Release build on this machine — see GAPS.md):
-#   - matchcompiler codegen OFF (== -DUSE_MATCHCOMPILER=Off): upstream
-#     non-Debug builds rewrite each lib/*.cpp via tools/matchcompiler.py
-#     (Token::Match -> generated matchers). Pure optimization, verified
-#     behavior-identical. cpp-pkg has no codegen hook.
-#   - no HAVE_BOOST (== -DUSE_BOOST=Off): upstream auto-detects ambient
-#     Boost and swaps std::vector for boost::container::small_vector.
-#     Performance-only.
-#   - upstream's warning setup (-Weverything + per-target -Wno-*) is not
-#     replicated; no per-target flags in v0.
-#   - precompiled headers (target_precompile_headers) not replicated.
-#
-# Runtime data: cppcheck loads cfg/*.cfg and platforms/*.xml relative to the
-# executable (or FILESDIR). Run stage-data.sh after building to copy them
-# next to build/cppcheck, mirroring upstream's copy_cfg/copy_platforms
-# post-build steps.
+# Deliberate divergences from upstream defaults (see GAPS.md):
+#   - matchcompiler codegen OFF (== -DUSE_MATCHCOMPILER=Off): tier-c
+#     per-source transform, still deferred; behavior-identical by upstream's
+#     own Verify contract.
+#   - Boost is DECLARED (system dep) instead of ambiently auto-detected
+#     (== -DUSE_BOOST=On): a Boost-less machine now errors at need-time
+#     instead of silently building a slower binary.
+#   - FILESDIR points at cpp-pkg's install layout share/cppcheck (upstream:
+#     share/Cppcheck) and is baked via ${install-prefix}.
+#   - precompiled headers (target_precompile_headers): still no PCH support.
+#   - clang's -mllvm -inline-deferral / -gdwarf-4 apply in every profile
+#     (upstream: Release/RelWithDebInfo only / clang>=14 only) — profile- or
+#     version-conditional flags are not expressible; both are perf/debug-info
+#     only.
+#   - Debug-profile stdlib hardening (_LIBCPP_HARDENING_MODE / Debug-only
+#     _GLIBCXX_DEBUG on libstdc++) is not replicated: platform-conditional
+#     defines cannot be profile-scoped ([profiles.*.cfg.*] reserved). This
+#     port bakes the Release branch for all profiles.
 
 schema-version = 1
 
@@ -43,59 +54,979 @@ schema-version = 1
 name = "cppcheck"
 version = "2.21.1"
 
-# Upstream overrides CMake's Release -O3 with -O2 (compileroptions.cmake).
+# ------------------------------------------------------------------
+# Upstream overrides CMake's Release -O3 with -O2 (compileroptions.cmake,
+# GNU|Clang branch). Last-wins over the builtin config flags is contract
+# since wave 1.
 [profiles.release]
 cxx-flags = ["-O2"]
 
-# Global defines replicated from cmake/compilerDefinitions.cmake +
-# includechecks.cmake for a Release/AppleClang/macOS build (upstream uses
-# add_definitions(), i.e. every target gets them, externals included):
-#   _GLIBCXX_DEBUG                       (Release else-branch; no-op on libc++)
-#   _LIBCPP_REMOVE_TRANSITIVE_INCLUDES
-#   HAVE_EXECINFO_H=1                    (check_include_file_cxx result)
-#   FILESDIR="/usr/local/share/Cppcheck" (default ${prefix}/share/${PROJECT_NAME})
-# cpp-pkg has no project-wide [defines], so they are repeated per target.
+# ------------------------------------------------------------------
+# Package flags: upstream's add_compile_options() environment, previously
+# unexpressible (wave-1 gap #4).
+[flags]
+cxx-flags = ["-pedantic"]           # upstream: GNU|Clang (MSVC out of scope)
 
+# transcribed: CMAKE_CXX_COMPILER_ID MATCHES "Clang" branch of
+# compileroptions.cmake. -Weverything + curated -Wno list, in upstream order.
+# add_compile_options_safe entries were probed against Apple clang 21;
+# -Wno-return-std-move-in-c++11 and -Wno-shadow-header are rejected there
+# (removed / not yet in Apple's branch) and dropped — cfg has no compiler
+# version predicate (reserved).
+[flags.cfg.clang]
+cxx-flags = [
+  "-Weverything",
+  "-mllvm", "-inline-deferral",     # transcribed: clang>=14 Release/RWDI perf
+                                    # workaround (llvm/llvm-project#53555);
+                                    # two argv words, not shell text
+  "-gdwarf-4",                      # transcribed: clang>=14 — DWARF4 for
+                                    # valgrind-class tools
+  "-Wno-sign-conversion",
+  "-Wno-shadow-field-in-constructor",
+  "-Wno-shorten-64-to-32",
+  "-Wno-implicit-int-conversion",
+  "-Wno-double-promotion",
+  "-Wno-shadow-field",
+  "-Wno-shadow-uncaptured-local",
+  "-Wno-implicit-float-conversion",
+  "-Wno-switch-enum",
+  "-Wno-date-time",
+  "-Wno-disabled-macro-expansion",
+  "-Wno-sign-compare",
+  "-Wno-ms-bitfield-padding",
+  "-Wno-unsafe-buffer-usage",
+  "-Wno-global-constructors",
+  "-Wno-exit-time-destructors",
+  "-Wno-padded",
+  "-Wno-nrvo",
+  "-Wno-c++98-compat",
+  "-Wno-c++98-compat-pedantic",
+  "-Wno-switch-default",
+  "-Wno-four-char-constants",
+  "-Wno-weak-vtables",
+  "-Wno-multichar",
+]
+
+# transcribed: CMAKE_CXX_COMPILER_ID STREQUAL "GNU" branch (Linux gcc; S5
+# validates on keres). -Wuseless-cast is _safe upstream; gcc >= 4.8 accepts.
+[flags.cfg.gcc]
+cxx-flags = [
+  "-Wall", "-Wextra", "-Wcast-qual", "-Wfloat-equal",
+  "-Wmissing-declarations", "-Wmissing-format-attribute", "-Wno-long-long",
+  "-Wpacked", "-Wredundant-decls", "-Wundef", "-Wno-sign-compare",
+  "-Wno-multichar", "-Woverloaded-virtual", "-pipe",
+  "-Wsuggest-attribute=noreturn", "-Wuseless-cast",
+]
+
+# Platform-conditional add_definitions() from compilerDefinitions.cmake.
+# There is no cfg-conditional package-scope `defines` home
+# ([target-defaults.cfg.*] is reserved), so these ride [flags.cfg.*] exactly
+# as upstream's directory-scope definitions do; -D_GLIBCXX_* is the
+# ABI-classified case the [flags] scope exists for. (The schema warns that
+# -D belongs in `defines` — accepted noise, recorded in GAPS.md.)
+#
+# transcribed: AppleClang/libc++ branch (non-Debug else-arm): _GLIBCXX_DEBUG
+# (no-op on libc++) + _LIBCPP_REMOVE_TRANSITIVE_INCLUDES. Keyed to os=macos,
+# not compiler=clang: Linux clang defaults to libstdc++, where upstream's
+# Release build defines neither (and adds -U_GLIBCXX_DEBUG for clang —
+# unnecessary here because the -D never applies off macOS).
+[flags.cfg.macos]
+cxx-flags = [
+  "-D_GLIBCXX_DEBUG",
+  "-D_LIBCPP_REMOVE_TRANSITIVE_INCLUDES",
+  "-Wno-poison-system-directories",  # transcribed: AppleClang-only warning
+                                     # relaxation; apple-clang predicate is
+                                     # reserved, macos is the honest key
+]
+
+# transcribed: check_include_file_cxx(execinfo.h HAVE_EXECINFO_H) — true on
+# macOS and glibc Linux; KNOWINGLY WRONG on musl (execinfo.h absent there;
+# lib/config.h would fall back to __has_include if the define were absent).
+[flags.cfg.unix]
+cxx-flags = ["-DHAVE_EXECINFO_H=1"]
+
+# ------------------------------------------------------------------
+# Upstream USE_BOOST=Auto silently picked up ambient Homebrew Boost
+# (header-only boost::container::small_vector swap, perf-only). Declared now:
+# system dependency, resolved via find_package(Boost), never built.
+[dependencies.boost]
+system       = true
+find-package = "Boost"
+
+# ------------------------------------------------------------------
+# Wave-1 gap #7 ("single ugliest thing"): 4 defines + cxx-std repeated on
+# every target -> [target-defaults]. HAVE_BOOST and FILESDIR are upstream
+# add_definitions() (every target, externals included). FILESDIR tracks the
+# actual install prefix now instead of a hardcoded /usr/local path.
+[target-defaults]
+cxx-std = 11
+defines = { private = ["HAVE_BOOST", 'FILESDIR="${install-prefix}/share/cppcheck"'] }
+
+# ------------------------------------------------------------------
+# Vendored externals (upstream wraps each in a tiny add_library).
+# Per-target -Wno relaxations were wave-1 gap #4; now real syntax.
 [targets.tinyxml2]
 type = "static-library"
 sources = ["externals/tinyxml2/*.cpp"]
-cxx-std = 11
 includes = { public = ["externals/tinyxml2"] }
-defines = { private = ["_GLIBCXX_DEBUG", "_LIBCPP_REMOVE_TRANSITIVE_INCLUDES", "HAVE_EXECINFO_H=1", 'FILESDIR="/usr/local/share/Cppcheck"'] }
+
+[targets.tinyxml2.cfg.clang]        # transcribed: tinyxml2 CMakeLists clang arm
+cxx-flags = [
+  "-Wno-implicit-fallthrough", "-Wno-suggest-destructor-override",
+  "-Wno-zero-as-null-pointer-constant", "-Wno-format-nonliteral",
+  "-Wno-inconsistent-missing-destructor-override", "-Wno-sign-conversion",
+  "-Wno-double-promotion",
+]
+
+[targets.tinyxml2.cfg.gcc]          # transcribed: tinyxml2 CMakeLists GNU arm
+cxx-flags = ["-Wno-suggest-attribute=format", "-Wno-useless-cast"]
 
 [targets.simplecpp]
 type = "static-library"
 sources = ["externals/simplecpp/*.cpp"]
-cxx-std = 11
 includes = { public = ["externals/simplecpp"] }
-defines = { private = ["_GLIBCXX_DEBUG", "_LIBCPP_REMOVE_TRANSITIVE_INCLUDES", "HAVE_EXECINFO_H=1", 'FILESDIR="/usr/local/share/Cppcheck"'] }
 
+[targets.simplecpp.cfg.clang]       # transcribed: simplecpp CMakeLists clang arm
+cxx-flags = ["-Wno-zero-as-null-pointer-constant"]
+
+# ------------------------------------------------------------------
 # Upstream: add_library(cppcheck-core OBJECT ...); PUBLIC include ".";
-# PRIVATE links tinyxml2 simplecpp picojson. Private static-lib deps
-# propagate as link-only in cpp-pkg (matches CMake $<LINK_ONLY:...>).
+# PRIVATE tinyxml2 simplecpp picojson; SYSTEM PUBLIC Boost includes.
+# Private static-lib deps propagate link-only ($<LINK_ONLY:...> parity).
 [targets.cppcheck-core]
 type = "static-library"
 sources = ["lib/*.cpp"]
-cxx-std = 11
 includes = { public = ["lib"], private = ["externals/picojson"] }
-defines = { private = ["_GLIBCXX_DEBUG", "_LIBCPP_REMOVE_TRANSITIVE_INCLUDES", "HAVE_EXECINFO_H=1", 'FILESDIR="/usr/local/share/Cppcheck"'] }
-dependencies = { private = ["tinyxml2", "simplecpp"] }
+# WORKAROUND (new wave-1 bug, see GAPS.md "install closure over-staging"):
+# `cpp-pkg install` closes the staging set over the executable's local dep
+# edges and derives headers for every closed-over static library, even
+# though none of the libraries is install = true (spec: executables ship a
+# self-contained bin/ artifact). lib/precompiled.h and cli/precompiled.h
+# then collide at include/precompiled.h. The override (legal negatives in
+# public-headers.patterns) dodges the collision so the binary install can
+# proceed; remove it when the planner stops staging non-installed libraries.
+public-headers = { base = "lib", patterns = ["*.h", "!precompiled.h"] }
+dependencies = { public = ["Boost::headers"], private = ["tinyxml2", "simplecpp"] }
 
-# Upstream: add_library(frontend ...); PUBLIC include "."; PRIVATE cppcheck-core.
 [targets.frontend]
 type = "static-library"
 sources = ["frontend/*.cpp"]
-cxx-std = 11
 includes = { public = ["frontend"] }
-defines = { private = ["_GLIBCXX_DEBUG", "_LIBCPP_REMOVE_TRANSITIVE_INCLUDES", "HAVE_EXECINFO_H=1", 'FILESDIR="/usr/local/share/Cppcheck"'] }
 dependencies = { private = ["cppcheck-core"] }
 
-# Upstream cli lib (GLOB *.cpp minus main.cpp) + cppcheck exe (main.cpp),
-# merged: no glob-exclude in cpp-pkg. cli links picojson for lib/json.h.
+# Upstream's cli library, reproducible at last (wave-1 gap #5):
+# file(GLOB *.cpp) minus main.cpp == ["cli/*.cpp", "!cli/main.cpp"].
+# The testrunner shares it, exactly like upstream.
+[targets.cli]
+type = "static-library"
+sources = ["cli/*.cpp", "!cli/main.cpp"]
+includes = { public = ["cli"], private = ["externals/picojson"] }
+# Same install-closure workaround as cppcheck-core (see GAPS.md).
+public-headers = { base = "cli", patterns = ["*.h", "!precompiled.h"] }
+dependencies = { private = ["cppcheck-core", "frontend", "tinyxml2", "simplecpp"] }
+
+# ------------------------------------------------------------------
+# The product. Threads::Threads is upstream's ${CMAKE_THREAD_LIBS_INIT}
+# (builtin pseudo-package since wave 1: -pthread on linux, nothing on macos).
+# runtime-data replaces stage-data.sh AND upstream's copy_cfg/copy_addons/
+# copy_platforms custom targets. remove_unsigned_platforms needs no
+# equivalent at this pin: a first draft carried "!*-unsigned.xml" and the
+# negative-matched-nothing warning correctly flagged that upstream deleted
+# those files — the drift guard working as designed.
 [targets.cppcheck]
 type = "executable"
-sources = ["cli/*.cpp"]
-cxx-std = 11
-includes = { private = ["cli", "externals/picojson"] }
-defines = { private = ["_GLIBCXX_DEBUG", "_LIBCPP_REMOVE_TRANSITIVE_INCLUDES", "HAVE_EXECINFO_H=1", 'FILESDIR="/usr/local/share/Cppcheck"'] }
-dependencies = ["cppcheck-core", "frontend", "tinyxml2", "simplecpp"]
+sources = ["cli/main.cpp"]
+dependencies = ["cppcheck-core", "cli", "tinyxml2", "simplecpp", "Threads::Threads"]
+install = true
+runtime-data = [
+  { from = "cfg",       patterns = ["*.cfg"] },
+  { from = "platforms", patterns = ["*.xml"] },
+  { from = "addons" },
+]
+
+# ------------------------------------------------------------------
+# Tests (wave-1 gap #9). testrunner = upstream test/*.cpp + the cli lib
+# (shared, not re-globbed). runtime-data is declared HERE TOO: byte-equal
+# dedupe makes the double declaration legal, so `cpp-pkg test` (which builds
+# only test targets) still stages cfg/platforms beside the runner.
+[targets.testrunner]
+type = "executable"
+test = true
+sources = ["test/*.cpp"]
+includes = { private = ["externals/picojson"] }
+dependencies = ["cppcheck-core", "tinyxml2", "simplecpp", "frontend", "cli", "Threads::Threads"]
+runtime-data = [
+  { from = "cfg",       patterns = ["*.cfg"] },
+  { from = "platforms", patterns = ["*.xml"] },
+  { from = "addons" },
+]
+
+[targets.testrunner.cfg.clang]      # transcribed: test CMakeLists clang arm
+cxx-flags = ["-Wno-dollar-in-identifier-extension"]
+
+[targets.testrunner.cfg.gcc]        # transcribed: test CMakeLists GNU arm
+cxx-flags = ["-Wno-useless-cast"]
+
+# NOTE: upstream's clang-13-only per-source relaxation on cli/
+# processexecutor.cpp (-Wno-reserved-identifier) is dead vocabulary on
+# clang >= 14 and per-source flags remain unsupported — moot here.
+
+# 85 [[targets.testrunner.run]] entries follow at the end of this file:
+# upstream REGISTER_TESTS ctest granularity (one invocation per
+# REGISTER_TEST fixture, cwd = the staged-data dir, like upstream's
+# WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}).
+
+# ------------------------------------------------------------------
+# Upstream's 28 cfg-* ctest entries invoke the PRODUCT binary (cppcheck)
+# against test/cfg/*.c(pp). A [[run]] entry can only spawn its own target's
+# binary, so this one-TU duplicate of the product exists solely to host
+# them (recorded as a gap: per-edge "run this other target" is missing).
+[targets.cppcheck-cfg-test]
+type = "executable"
+test = true
+sources = ["cli/main.cpp"]
+dependencies = ["cppcheck-core", "cli", "tinyxml2", "simplecpp", "Threads::Threads"]
+runtime-data = [
+  { from = "cfg",       patterns = ["*.cfg"] },
+  { from = "platforms", patterns = ["*.xml"] },
+  { from = "addons" },
+]
+
+# ------------------------------------------------------------------
+# Dev-graph helpers (upstream builds these under BUILD_TESTING / marks
+# EXCLUDE_FROM_ALL): excluded from the default build, buildable by name.
+[targets.test-signalhandler]
+type = "executable"
+dev = true
+sources = ["test/signal/test-signalhandler.cpp", "cli/signalhandler.cpp", "cli/stacktrace.cpp"]
+includes = { private = ["cli", "lib"] }
+
+[targets.test-signalhandler.cfg.unix]  # transcribed: GNU|Clang arm; -rdynamic
+cxx-flags  = ["-Wno-missing-declarations", "-Wno-missing-prototypes"]
+link-flags = ["-rdynamic"]             # for backtrace() symbol names (not AIX)
+
+[targets.test-stacktrace]
+type = "executable"
+dev = true
+sources = ["test/signal/test-stacktrace.cpp", "cli/stacktrace.cpp"]
+includes = { private = ["cli", "lib"] }
+
+[targets.test-stacktrace.cfg.unix]
+cxx-flags  = ["-Wno-missing-declarations", "-Wno-missing-prototypes"]
+link-flags = ["-rdynamic"]
+
+[targets.test-sehwrapper]           # Windows SEH probe; compiles to a stub
+type = "executable"                 # main() elsewhere (upstream builds it
+dev = true                          # unconditionally too)
+sources = ["test/seh/test-sehwrapper.cpp", "cli/sehwrapper.cpp"]
+includes = { private = ["cli", "lib"] }
+
+[targets.dmake]                     # upstream: EXCLUDE_FROM_ALL build tool
+type = "executable"                 # (regenerates Makefile/testfile lists;
+dev = true                          # the run-dmake source-tree write is NOT
+sources = ["tools/dmake/dmake.cpp"] # modeled — no [generate] home for it)
+dependencies = ["cppcheck-core", "cli", "simplecpp"]
+
+# ------------------------------------------------------------------
+# Upstream REGISTER_TESTS: one ctest entry per REGISTER_TEST fixture
+# (85 of them at this pin), cwd = the staged-data/build dir, exactly
+# like upstream's WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}.
+
+[[targets.testrunner.run]]
+name = "Test64BitPortability"
+args = ["Test64BitPortability"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestAnalyzerInformation"
+args = ["TestAnalyzerInformation"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestAssert"
+args = ["TestAssert"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestAstUtils"
+args = ["TestAstUtils"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestAutoVariables"
+args = ["TestAutoVariables"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestBool"
+args = ["TestBool"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestBufferOverrun"
+args = ["TestBufferOverrun"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestCharVar"
+args = ["TestCharVar"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestCheck"
+args = ["TestCheck"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestCheckersReport"
+args = ["TestCheckersReport"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestClangImport"
+args = ["TestClangImport"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestClass"
+args = ["TestClass"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestCmdlineParser"
+args = ["TestCmdlineParser"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestColor"
+args = ["TestColor"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestCondition"
+args = ["TestCondition"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestConstructors"
+args = ["TestConstructors"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestCppcheck"
+args = ["TestCppcheck"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestErrorLogger"
+args = ["TestErrorLogger"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestExceptionSafety"
+args = ["TestExceptionSafety"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestExecutor"
+args = ["TestExecutor"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestFileLister"
+args = ["TestFileLister"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestFileSettings"
+args = ["TestFileSettings"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestFrontend"
+args = ["TestFrontend"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestFunctions"
+args = ["TestFunctions"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestGarbage"
+args = ["TestGarbage"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestImportProject"
+args = ["TestImportProject"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestIncompleteStatement"
+args = ["TestIncompleteStatement"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestInternal"
+args = ["TestInternal"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestIO"
+args = ["TestIO"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestLeakAutoVar"
+args = ["TestLeakAutoVar"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestLeakAutoVarPosix"
+args = ["TestLeakAutoVarPosix"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestLeakAutoVarRecursiveCountLimit"
+args = ["TestLeakAutoVarRecursiveCountLimit"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestLeakAutoVarStrcpy"
+args = ["TestLeakAutoVarStrcpy"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestLeakAutoVarWindows"
+args = ["TestLeakAutoVarWindows"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestLibrary"
+args = ["TestLibrary"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestMathLib"
+args = ["TestMathLib"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestMemleak"
+args = ["TestMemleak"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestMemleakInClass"
+args = ["TestMemleakInClass"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestMemleakInFunction"
+args = ["TestMemleakInFunction"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestMemleakNoVar"
+args = ["TestMemleakNoVar"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestMemleakStructMember"
+args = ["TestMemleakStructMember"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestNullPointer"
+args = ["TestNullPointer"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestOptions"
+args = ["TestOptions"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestOther"
+args = ["TestOther"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestPath"
+args = ["TestPath"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestPathMatch"
+args = ["TestPathMatch"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestPlatform"
+args = ["TestPlatform"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestPostfixOperator"
+args = ["TestPostfixOperator"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestPreprocessor"
+args = ["TestPreprocessor"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestProcessExecutorFiles"
+args = ["TestProcessExecutorFiles"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestProcessExecutorFS"
+args = ["TestProcessExecutorFS"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestProgramMemory"
+args = ["TestProgramMemory"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestRegExPcre"
+args = ["TestRegExPcre"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestSarifReport"
+args = ["TestSarifReport"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestSettings"
+args = ["TestSettings"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestSimplifyTemplate"
+args = ["TestSimplifyTemplate"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestSimplifyTokens"
+args = ["TestSimplifyTokens"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestSimplifyTypedef"
+args = ["TestSimplifyTypedef"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestSimplifyUsing"
+args = ["TestSimplifyUsing"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestSingleExecutorFiles"
+args = ["TestSingleExecutorFiles"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestSingleExecutorFS"
+args = ["TestSingleExecutorFS"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestSizeof"
+args = ["TestSizeof"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestStandards"
+args = ["TestStandards"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestStl"
+args = ["TestStl"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestString"
+args = ["TestString"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestSummaries"
+args = ["TestSummaries"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestSuppressions"
+args = ["TestSuppressions"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestSymbolDatabase"
+args = ["TestSymbolDatabase"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestThreadExecutorFiles"
+args = ["TestThreadExecutorFiles"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestThreadExecutorFS"
+args = ["TestThreadExecutorFS"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestTimer"
+args = ["TestTimer"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestToken"
+args = ["TestToken"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestTokenizer"
+args = ["TestTokenizer"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestTokenList"
+args = ["TestTokenList"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestTokenRange"
+args = ["TestTokenRange"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestType"
+args = ["TestType"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestUninitVar"
+args = ["TestUninitVar"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestUnusedFunctions"
+args = ["TestUnusedFunctions"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestUnusedPrivateFunction"
+args = ["TestUnusedPrivateFunction"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestUnusedVar"
+args = ["TestUnusedVar"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestUtils"
+args = ["TestUtils"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestVaarg"
+args = ["TestVaarg"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestValueFlow"
+args = ["TestValueFlow"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestValueFlowValue"
+args = ["TestValueFlowValue"]
+cwd  = "${build-dir}"
+
+[[targets.testrunner.run]]
+name = "TestVarID"
+args = ["TestVarID"]
+cwd  = "${build-dir}"
+
+# Upstream cfg-* ctest entries (add_cfg in test/CMakeLists.txt),
+# transcribed argv-for-argv; library = declared extra libs + the file's
+# own basename, platform default unix64.
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-boost_cpp"
+args = [
+  "--library=boost", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/boost.cpp",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-bsd_c"
+args = [
+  "--library=bsd", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/bsd.c",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-cairo_c"
+args = [
+  "--library=cairo", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/cairo.c",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-cppunit_cpp"
+args = [
+  "--library=cppunit", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/cppunit.cpp",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-emscripten_cpp"
+args = [
+  "--library=emscripten", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/emscripten.cpp",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-gnu_c"
+args = [
+  "--library=posix,gnu", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/gnu.c",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-googletest_cpp"
+args = [
+  "--library=googletest", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/googletest.cpp",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-gtk_c"
+args = [
+  "--library=gtk", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/gtk.c",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-kde_cpp"
+args = [
+  "--library=qt,kde", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/kde.cpp",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-libcurl_c"
+args = [
+  "--library=libcurl", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/libcurl.c",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-libsigc___cpp"
+args = [
+  "--library=libsigc++", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/libsigc++.cpp",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-lua_c"
+args = [
+  "--library=lua", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/lua.c",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-mfc_cpp"
+args = [
+  "--library=mfc", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/mfc.cpp",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-opencv2_cpp"
+args = [
+  "--library=opencv2", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/opencv2.cpp",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-openmp_c"
+args = [
+  "--library=openmp", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/openmp.c",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-openssl_c"
+args = [
+  "--library=openssl", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/openssl.c",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-posix_c"
+args = [
+  "--library=posix", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/posix.c",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-python_c"
+args = [
+  "--library=python", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/python.c",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-qt_cpp"
+args = [
+  "--library=qt", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/qt.cpp",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-selinux_c"
+args = [
+  "--library=selinux", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/selinux.c",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-sqlite3_c"
+args = [
+  "--library=sqlite3", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/sqlite3.c",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-std_c"
+args = [
+  "--library=std", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/std.c",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-std_cpp"
+args = [
+  "--library=std", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/std.cpp",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-windows32A"
+args = [
+  "--library=windows", "--check-library", "--check-level=exhaustive",
+  "--platform=win32A", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/windows.cpp",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-windows32W"
+args = [
+  "--library=windows", "--check-library", "--check-level=exhaustive",
+  "--platform=win32W", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/windows.cpp",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-windows64"
+args = [
+  "--library=windows", "--check-library", "--check-level=exhaustive",
+  "--platform=win64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/windows.cpp",
+]
+
+[[targets.cppcheck-cfg-test.run]]
+name = "cfg-wxwidgets_cpp"
+args = [
+  "--library=wxwidgets", "--check-library", "--check-level=exhaustive",
+  "--platform=unix64", "--enable=style,information", "--inconclusive",
+  "--force", "--error-exitcode=1", "--inline-suppr",
+  "--debug-warnings", "--suppress=checkersReport",
+  "test/cfg/wxwidgets.cpp",
+]

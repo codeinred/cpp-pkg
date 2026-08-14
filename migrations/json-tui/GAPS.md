@@ -1,164 +1,155 @@
-# GAPS — json-tui migration
+# GAPS — json-tui migration, wave-2 edition
 
-Every friction point hit while porting json-tui v1.4.2 from
-CMake+FetchContent to cpp-pkg, keyed to the design questions.
+Wave-1 findings re-examined after the wave-1 extensions landed. Every
+workaround the wave targeted is dissolved — this manifest now mirrors
+upstream's CMake structure line for line, with zero suppressions and zero
+out-of-band scripts. New findings from exercising the wave-1 features are
+under "Remaining" (the install-verb bug is the important one).
 
-## 1. `configure_file` version header (codegen-escape-hatch) — MAJOR
+Validated 2026-08-14, macOS arm64, Apple clang 21, CMake 4.4, fresh store:
+build green (no googletest work), `cpp-pkg test` green (4 gtest cases),
+parity 6/6 vs upstream CMake, second build+test full store cache hit.
 
-Upstream generates `${BINARY_DIR}/src/version.hpp` from `src/version.hpp.in`
-by substituting `@CMAKE_PROJECT_VERSION@`. This is the single most common
-codegen pattern in the wild (version/config headers), and cpp-pkg has no way
-to express it. Workaround: `pin.sh` pre-generates `gen/src/version.hpp` with
-`sed`, and the version string is now duplicated in three places (pin.sh, the
-manifest's `[package].version`, upstream's CMakeLists).
+## Dissolved (wave-1 workaround → wave-1 feature)
 
-What an escape hatch would have needed here, in ascending generality:
-(a) built-in `configure-file`-style substitution with access to
-`[package].version` (covers this project outright and probably the majority
-of real-world cases); (b) a generic "run command, declare outputs, outputs
-land on an include path" step with correct rebuild tracking. Notably (a)
-requires no arbitrary-command machinery at all.
+1. **`configure_file` version header** (was #1, MAJOR; pin.sh pre-generated
+   `gen/src/version.hpp` with sed, version stated 3×) →
+   **`[generate.version-header]`** tier-a template step with
+   `vars = { CMAKE_PROJECT_VERSION = "${package.version}" }`. Version stated
+   once; both consumers reference `${gen}/src`; `--version` output is
+   byte-identical to upstream's configure_file build. pin.sh's codegen
+   block is deleted.
 
-## 2. Submodule guard false-positives on empty `.gitmodules` (dep-provisioning) — MAJOR
+2. **Submodule-guard false positive on args' 0-byte `.gitmodules`**
+   (was #2, MAJOR; forced the commit tarball via url+sha256) → guard now
+   triggers on actual gitlink entries (tool fix A.6). Upstream's exact
+   spelling `git` + `rev = "114200a9…"` resolves, locks, and builds.
 
-Declaring upstream's exact pin `Taywee/args @ 114200a9` as `git`+`rev` is
-refused: "repository ... uses git submodules (gitlink entries or .gitmodules
-present)". But at that commit `.gitmodules` is **0 bytes** and `git ls-tree
--r HEAD` shows **no** 160000 gitlink entries — there are no submodules,
-only a stale empty file. The refuse-don't-silently-skip policy is right; the
-detector should trigger on actual gitlink entries (or a .gitmodules that
-parses to ≥1 submodule), not on file presence. Workaround: the GitHub commit
-tarball via `url`+`sha256` (error message helpfully suggests this).
+3. **`.tar.xz` rejected** (was #3, MINOR; nlohmann_json via the ~180MB
+   -unpacked GitHub tag tarball) → fetch whitelist now accepts
+   `.tar.xz`/`.tar.bz2` (tool fix A.7). The dependency is upstream's exact
+   112KB release asset `json.tar.xz`, provenance restored, sha256 declared.
 
-## 3. Only `.tar.gz`/`.tgz`/`.zip` url deps (dep-provisioning) — MINOR
+4. **No per-target flags** (was #4, MAJOR — broke the build: profile-scope
+   flags gave `tests` -Werror, tripping gtest's -Wcharacter-conversion) →
+   **per-target `cxx-flags` with visibility** + **`cfg.unix`**: the warning
+   set is `{ private = [...] }` on `json-tui-lib` and `json-tui` under
+   `[targets.*.cfg.unix]` (transcribed: `if (NOT WIN32)`), absent from
+   `tests` exactly as upstream shields it; `-fno-exceptions` is
+   `{ public = [...] }` on the lib and propagates to both consumers
+   (verified on compile lines). Both duplicated `[profiles.*]` stanzas and
+   the `-Wno-error=character-conversion` suppression are deleted — zero
+   suppressions remain.
 
-Upstream fetches nlohmann's release asset `json.tar.xz`. cpp-pkg rejects
-`.tar.xz` (fetch.rs whitelist). Workaround: GitHub tag tarball (`.tar.gz`)
-of the same release — but that is a *different artifact* (full repo, ~180MB
-unpacked with tests/docs, vs the trimmed 43MB release asset), so the
-workaround costs download size and loses upstream's exact provenance.
-`tar -xJf`/`-xf` is the same system tar already shelled out to; supporting
-`.tar.xz`/`.tar.bz2` is nearly free.
+5. **Dep headers arrived `-I`, not `-isystem`** (was #4b, MAJOR,
+   co-culprit of the break) → imported-target interface includes now
+   classify as system includes at manifest ingestion (tool fix A.1); every
+   dep include on every compile line is `-isystem` (verified), matching the
+   CMake behavior extraction claims to replicate. No manifest surface
+   needed.
 
-## 4. No per-target compile flags (per-target-flags) — MAJOR, broke the build
+6. **`find-package` undocumented** (was #10, MINOR) → documented in
+   CPPKG_TOML.md; `find-package = "GTest"` on the googletest dev-dep works
+   as before.
 
-Upstream's flag structure is genuinely per-target and per-visibility:
+7. **`Threads::Threads` forced arbitrary ownership** (was #11, MINOR;
+   `exposes-targets = ["Threads::Threads"]` on ftxui) → builtin
+   pseudo-package (ladder step 0). The ownership line is deleted; both
+   ftxui's and googletest's imports resolve to the builtin.
 
-- `-Wall -Wextra -pedantic -Werror -Wmissing-declarations -Wshadow`
-  PRIVATE on `json-tui-lib` and `json-tui` only;
-- `-fno-exceptions` PUBLIC on `json-tui-lib` (propagates to consumers);
-- the gtest `tests` target is deliberately exempt from the warning set
-  (it still inherits `-fno-exceptions` through the lib's PUBLIC flag).
+8. **No test story** (was #5, MAJOR) → **`[dev-dependencies]` +
+   `test = true` + `cpp-pkg test`**: googletest moved to
+   `[dev-dependencies]`; `tests` is `test = true` (leaves the default
+   build — upstream's `JSON_TUI_BUILD_TESTS=OFF` default, translated);
+   `cpp-pkg build` does zero googletest store work and, with the committed
+   lockfile, zero network (verified on a fresh store); `cpp-pkg test`
+   provisions it lazily and runs the gtest binary (zero `[[run]]` entries =
+   the one default invocation = the whole 4-case suite). Locking stays
+   eager: the lockfile carries googletest from any machine.
 
-cpp-pkg's only flag surface is profile-level `cxx-flags`, which hit every
-consumer target equally and must be duplicated per profile (`release` and
-`debug` blocks are copy-paste). This actually failed, not hypothetically:
-`tests` got `-Werror`, and gtest's `gtest-printers.h:483` trips
-`-Wcharacter-conversion` under C++20 with Apple clang 21 → hard error in a
-target the upstream author explicitly shields from `-Werror`. Workaround:
-`-Wno-error=character-conversion` in the profile flags (global demotion of
-one diagnostic — a scope reduction upstream does not need). What's missing:
-`cxx-flags`/`link-flags` on `[targets.*]` with public/private visibility
-(the existing includes/defines visibility model extends naturally;
-`-fno-exceptions` PUBLIC is precisely a propagating compile requirement).
+9. **Old-CMake dep under CMake ≥ 4** (was #6, MINOR) —
+   `CMAKE_POLICY_VERSION_MINIMUM = "3.5"` as an ordinary dep option remains
+   the working pattern for the 2021 googletest pin; unchanged, still fine.
+   (The A.9 error-translation fix was not exercised here since the option
+   is declared up front.)
 
-Related ergonomic wart (schema-ergonomics, minor): identical profile flag
-blocks must be repeated for each of the four built-in profiles; flags that
-should apply to *all* profiles have no home.
+10. **Directory-scoped `add_definitions`** (was #7, MINOR; modeled as a
+    PUBLIC define on the lib — reached the right TUs but by propagation,
+    not by scope) → **`[target-defaults]`**
+    `defines = { private = ["JSON_NOEXCEPTION"] }` hits all three targets
+    directly, the exact translation of directory scope. `cxx-std = 17`
+    rides the same table as a fill-if-absent scalar (`tests` overrides
+    with 20 — upstream's `cxx_std_17`/`cxx_std_20` split).
 
-## 4b. Dependency includes are `-I`, not `-isystem` (per-target-flags) — MAJOR
+11. **Install not expressible** (was #8, MINOR) → `install = true` on the
+    `json-tui` executable is the declared translation of
+    `install(TARGETS json-tui RUNTIME)`. The *declaration* is now schema
+    syntax; the *verb* is broken for this shape — see Remaining #1.
 
-Co-culprit of the failure above, and independently wrong: CMake treats
-imported targets' `INTERFACE_INCLUDE_DIRECTORIES` as SYSTEM includes by
-default (`NO_SYSTEM_FROM_IMPORTED` exists to opt *out*), so upstream
-consumers never see dep-header warnings. cpp-pkg's manifest has a
-`system_includes` bucket and the toolchain layer can emit `-isystem`
-(toolchain.rs:264), but the tier-2 probe only fills the bucket from explicit
-SYSTEM properties, so store deps' headers arrive via `-I` and are exposed to
-the consumer's warning flags. gtest, and any dep with warnings under a
-strict flag set, breaks projects that build `-Werror`. Fix direction: the
-probe (or manifest ingestion) should classify imported-target interface
-includes as system by default, matching the CMake behavior the extraction
-claims to replicate.
+(Wave-1 #9, the positive finding on component deps, stands: the
+FetchContent→declared-deps core needed no name-resolution workarounds, and
+is now one line shorter with the Threads builtin.)
 
-## 10. Probe `find_package` name defaults to the dep key; override is undocumented (schema-ergonomics) — MINOR
+## Remaining
 
-`find_package(googletest)` fails — the installed config is
-`GTestConfig.cmake`. The implementation already has the right escape hatch
-(`find-package = "GTest"` on the dependency, schema.rs:133), and it worked
-first try — but it is absent from CPPKG_TOML.md, so a user only discovers
-it by reading the source. Document it; also consider having the probe retry
-with common case variants or scan `lib/cmake/*/ *Config.cmake` in the just-
-installed prefix (the probe already knows the exact install dir, so the
-correct name is discoverable automatically).
+### 1. NEW BUG — `cpp-pkg install` of an executable drags its non-exported static lib into staging (install-export) — MAJOR
 
-## 11. Shared system-module targets (`Threads::Threads`) force arbitrary ownership (dep-provisioning) — MINOR
+`install = true` on `json-tui` alone (upstream ships only the RUNTIME
+binary), and the verb hard-errors:
 
-Both ftxui's and googletest's configs `find_package(Threads)`; both
-manifests export `Threads::Threads`; any reference to it is ambiguous until
-one dependency claims it via `exposes-targets`. The error message is
-excellent (it names both candidates and spells out the exact fix), and the
-one-line workaround (`exposes-targets = ["Threads::Threads"]` on ftxui)
-resolved everything. But the semantics is a small lie — ftxui does not own
-Threads; it is a CMake find-module target that *any* config may import.
-A curated builtin list of well-known system module targets (Threads::,
-Threads/OpenMP/X11/OpenGL::, etc.) treated as shared-and-identical would
-remove the arbitrary-ownership declaration from nearly every multi-dep
-migration on day one.
+    error: target 'json-tui-lib' is exported but its header derivation is
+    empty (public include dirs: []) — add public headers, a public-headers
+    override, or remove install = true
 
-## 5. No test story (testing-story) — MAJOR
+json-tui-lib has `install = false`. The two halves of shim.rs disagree:
 
-Upstream: tests are opt-in (`JSON_TUI_BUILD_TESTS=ON`), googletest is
-fetched only then, `gtest_discover_tests` registers per-case CTest entries.
-In the port:
+- `validate_exported_closure` (shim.rs:560) is correct per spec §6.3 and
+  its own doc comment — "Executables statically link their closure and
+  impose no such rule" — so validation passes.
+- `plan_install` (shim.rs:~866) then closes the *selection* over local dep
+  edges unconditionally, with a comment claiming "closure members are
+  exported per validation" — false for executables, since validation
+  deliberately exempted them. Every selected static-library member is then
+  staged to `lib/` and run through `derive_headers` regardless of its own
+  `install` flag → hard error for any internal header-less lib.
 
-- `tests` is an always-built plain executable; `cpp-pkg build` builds
-  googletest even for someone who only wants the app. No `[dev-dependencies]`
-  / per-target dep gating.
-- No `cpp-pkg test`: running is manual (`./build/tests`). Nothing discovers
-  gtest cases or reports them individually.
-- No way to express "this target only exists when testing" —
-  conditional-sources and testing-story meet here; a cargo-style implicit
-  test profile (test targets + test-only deps built only on `cpp-pkg test`)
-  would cover this project completely.
+Control experiment confirming the mechanism: giving the lib public
+includes makes the plan succeed but stage `lib/libjson-tui-lib.a`, five
+headers, and `lib/cmake/json-tui/*` — none of which upstream installs, for
+a target whose manifest still says `install = false`.
 
-## 6. Old-CMake deps under CMake ≥ 4 (dep-provisioning) — MINOR (works, worth blessing)
+Consequence: **`install = true` on a product executable that links any
+local static library is un-installable** — precisely the "one line each"
+shape §6.8's migration note promises for ninja and json-tui (ninja's
+`libninja` will hit this identically). Fix direction: the selection
+closure should expand only through *exported libraries'* local edges (their
+archives must reach consumers); an executable's local static libs are
+linked in and need no staging. Both `install` (all-exported) and
+`install json-tui` (named) forms fail today. The manifest keeps the honest
+`install = true`; blocked-with-diagnosis over fake green.
 
-The pinned googletest commit (2021) declares `cmake_minimum_required` < 3.5
-and CMake 4.4 refuses to configure it. Passing
-`CMAKE_POLICY_VERSION_MINIMUM = "3.5"` as an ordinary dep `option` works —
-good — but this will hit *every* migration that pins an old dep, and users
-have to know the incantation. Worth either documenting as the blessed
-pattern or translating CMake's error into a hint the way find_dependency
-failures already are. (Upstream's own CMake build needs the same flag.)
+### 2. Per-case test discovery (testing-story) — MINOR, acknowledged deferred
 
-## 7. Directory-scoped `add_definitions` (schema-ergonomics) — MINOR
+Upstream's `gtest_discover_tests` registers each of the 4 cases as its own
+CTest entry; `cpp-pkg test` runs the gtest binary as one invocation (pass =
+exit 0). Fine at this scale — a failing case still fails the invocation and
+the captured output is replayed — but there is no per-case reporting or
+filtering below target granularity (`-- --gtest_filter=...` passthrough is
+the manual escape hatch). Matches the wave's own deferred registry ("case
+discovery / output-matching test harnesses").
 
-Upstream's `add_definitions(-DJSON_NOEXCEPTION)` applies to all targets in
-the directory. The port models it as a PUBLIC define on `json-tui-lib`,
-which reaches all three targets only because they all happen to depend on
-the lib. That's a faithful-enough translation here, but the mapping required
-understanding CMake scoping subtleties; a top-level `[defines]`/"applies to
-all project targets" block would make such ports mechanical.
+### 3. `compile_commands.json` is regenerated per-verb, for that verb's target set only (schema-ergonomics) — MINOR
 
-## 8. Install/packaging not expressible (install-export) — MINOR here
+After `cpp-pkg build` it contains the 6 default-set TUs (no
+`expander_test.cpp`); after `cpp-pkg test` it contains `expander_test.cpp`
+but has *lost* `main.cpp`. Whichever verb ran last wins, so clangd/IDE
+users get broken navigation for the other half of the project. A union
+(regenerate entries for all known targets, or merge instead of overwrite)
+would fix it.
 
-Upstream has `install(TARGETS json-tui RUNTIME DESTINATION bin)` plus a full
-CPack section (DEB/RPM/DMG/...). cpp-pkg has no `install` verb, so the port
-simply drops this. For a leaf application it only costs `make install`
-convenience (minor), but it is the same missing surface that would block
-migrating any *library* project: nothing in the schema says what a package
-exports to the outside world.
+### 4. CPack packaging (install-export) — deliberate non-goal, unchanged
 
-## 9. Component deps were near-friction-free (positive finding)
-
-FTXUI's three components resolved exactly as declared
-(`ftxui::screen|dom|component`, PRIVATE on a static lib → link-only
-propagation to the exe; the store manifest also exposes the aggregate
-`ftxui::ftxui`), `taywee::args` and `GTest::gtest_main` resolved via the
-unique-name ladder without `exposes-*` declarations, and the PUBLIC/PRIVATE
-dependency split mapped 1:1 from `target_link_libraries`. Apart from the
-`Threads::Threads` ownership line (#11), the FetchContent→declared-
-dependency conversion itself — the core bet of the tool — needed no name-
-resolution workarounds, and the second build was a full store cache hit for
-all four dependencies.
+Upstream's DEB/RPM/DMG generator matrix has no cpp-pkg surface; `--destdir`
+is the packager interface, per the wave's out-of-scope ruling. Recorded,
+not contested. Likewise `JSON_TUI_CLANG_TIDY` (a lint-driver option, not a
+build product) is out of scope.

@@ -1,4 +1,7 @@
-# Ecosystem test: consume googletest as a normal cpp-pkg GIT dependency.
+# Ecosystem test: consume googletest as a cpp-pkg GIT dependency.
+# Wave-2 edition: googletest is a [dev-dependency] (a library consumer of
+# this package would never resolve or build it), the test target carries
+# `test = true`, and the suite runs via `cpp-pkg test`.
 # Upstream's CMake build installs GTestConfig.cmake exporting GTest::gtest,
 # GTest::gtest_main, GTest::gmock, GTest::gmock_main (tier-2 probe).
 
@@ -8,13 +11,12 @@ schema-version = 1
 name = "gtest-consumer"
 version = "0.1.0"
 
-[dependencies.googletest]
+[dev-dependencies.googletest]
 git = "https://github.com/google/googletest"
 tag = "v1.18.0"
 # Upstream installs GTestConfig.cmake, so the probe must call
-# find_package(GTest), not find_package(googletest). NOTE: `find-package`
-# exists in the implementation (src/schema.rs) but is absent from
-# CPPKG_TOML.md — see GAPS.md.
+# find_package(GTest), not find_package(googletest). `find-package` is now
+# documented in CPPKG_TOML.md (wave-1 tool fix 4).
 find-package = "GTest"
 # Dep key "googletest" != exported namespace "GTest::"; single-dep projects
 # resolve by uniqueness (ladder step 1), but declare ownership explicitly.
@@ -22,6 +24,11 @@ exposes-namespace = ["GTest"]
 
 [targets.calc_test]
 type = "executable"
+test = true                      # dev graph; may reference dev-dep targets
 sources = ["test/calc_test.cc"]
 cxx-std = 17
 dependencies = ["GTest::gmock", "GTest::gtest_main"]
+
+[[targets.calc_test.run]]
+name = "default"
+args = ["--gtest_brief=1"]

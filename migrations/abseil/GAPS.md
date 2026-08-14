@@ -1,173 +1,193 @@
-# Gaps found migrating abseil-cpp 20260526.0
+# Gaps — abseil-cpp 20260526.0, wave-2 edition (S4 re-migration)
 
-Each item tagged with the design-question key. Severity: blocker = stops the
-migration without a workaround; major = real friction, workaround exists;
-minor = cosmetic/latent.
+Wave-1 findings re-audited against the wave-1 extensions. "Dissolved" maps
+each wave-1 workaround to the feature that killed it, in real syntax.
+"Remaining" is honest: it includes NEW bugs found in the wave-1 features
+themselves. Severity: blocker / major / minor as before.
 
-## schema-ergonomics — the target-count question (headline finding)
+## Dissolved (workaround → feature)
 
-**Numbers.** Demo closure = 93 library targets, 660 generated TOML lines
-(7.1 lines/target). Full abseil = 216 non-test libraries + 40 TESTONLY
-libraries + 241 test executables. Extrapolation: ~1,550 TOML lines for all
-non-test libraries; ~4,300+ lines with tests. Hand-writing is out of the
-question; hand-*maintaining* across LTS bumps doubly so (upstream reshuffles
-internal targets every release — e.g. this LTS added
-`strings_append_and_overwrite`, `iterator_traits_internal`).
+1. **`file://` patched clone for the consumer → nothing at all.**
+   Wave 1: upstream's `absl::strings → absl::strings` self-edge hard-errored
+   as a cycle; the only out was pin.sh's locally cloned+patched+tagged repo
+   (per-machine commit sha ⇒ per-machine config hash ⇒ unshareable store,
+   uncommittable lockfile). Wave 2: self-link edges in extracted manifests
+   are deduped tool-side (tool-fix batch #2), so the consumer needs **no
+   patch and no `patches = [...]` either** — the dep is upstream truth:
+   ```toml
+   [dependencies.abseil]
+   git = "https://github.com/abseil/abseil-cpp"
+   tag = "20260526.0"
+   find-package = "absl"
+   ```
+   Verified: lockfile pins the real commit `5650e9cf…`; a second checkout
+   rebuilds from the store with zero "building dependency" lines (the exact
+   sharing the wave-1 workaround destroyed). `patches/` and the pin.sh
+   clone/sed machinery are deleted.
 
-**What actually worked: a generator.** `gen_toml.py` (~150 lines of Python)
-parses `absl_cc_library` calls and emits the TOML mechanically. Writing it +
-debugging took well under an hour because abseil's CMake is Bazel-shaped.
-Verdict on "schema sugar vs generator tool": **both, in different roles**:
+2. **Dep key ≡ CMake package name → `find-package`.** Wave 1 forced the key
+   `absl` because the probe ran `find_package(<depkey>)`. The key is now
+   `abseil` with `find-package = "absl"` (documented in tool-fix batch #4).
 
-- A converter tool is the only realistic on-ramp at this scale — but abseil
-  is the *easy* case (structured macro calls). A general CMake→CppPkg
-  converter would need the file-API/configure-probe route, not text parsing.
-- Schema sugar attacks the 93× repetition the generator had to emit:
-  `cxx-std = 17` and `includes = { public = ["."] }` appear identically in
-  every one of the 93 targets (~190 lines, 29% of the generated text, is
-  pure repetition). A `[target-defaults]` table (or per-directory defaults)
-  would eliminate it and make even generated files reviewable.
-- TOML has no include mechanism, so generated blocks and the hand-written
-  prologue share one 684-line file with a "generated below this line"
-  marker. A `targets-from = "..."` include (or a conventions like
-  `CppPkg.d/*.toml`) would keep generator output out of the hand-edited
-  file.
-- Target globbing (the other idea in the question) would NOT have helped
-  here: abseil's value is precisely its fine-grained dep graph; globbing
-  sources into one blob discards it. Defaults + generator preserve it.
+3. **COPTS dropped wholesale → `[flags.cfg.clang]` / `[flags.cfg.gcc]`.**
+   Upstream's per-compiler split (`ABSL_LLVM_FLAGS` / `ABSL_GCC_FLAGS`) is
+   transcribed 1:1 in header.toml (~40 flags clang, 15 gcc); per-test
+   deltas (`ABSL_*_TEST_FLAGS` minus base — last-wins layering makes the
+   trailing `-Wno-*` entries exact) are emitted per test target under
+   `[targets.<t>.cfg.clang/gcc] cxx-flags`. The whole 88-test suite and the
+   93-lib build compile with **zero warnings** under Apple clang 21 — the
+   "build it the way its authors intended" gap is closed on this platform.
 
-Severity: major (workaround: generator script, checked in).
+4. **CoreFoundation hoisted into `[profiles.release] link-flags` →
+   `[targets.time_zone.cfg.macos]`.**
+   ```toml
+   [targets.time_zone.cfg.macos]
+   link-flags = { public = ["-Wl,-framework,CoreFoundation"] }  # transcribed: $<$<PLATFORM_ID:Darwin,...>:...>
+   ```
+   Target-scoped (no longer sprayed on every executable) and
+   config-independent (no longer silently lost under `--config debug`).
+   The `public` spelling is a deliberate workaround for Remaining #1.
 
-## object-libraries / interface targets — no header-only target kind
+5. **Dropped Linux/system link inputs → cfg + builtin.** Wave 1's port was
+   a macOS projection: `Threads::Threads` and `$<$<BOOL:${LIBRT}>:-lrt>`
+   were dropped ("nowhere to put it"). Now: `Threads::Threads` is emitted
+   verbatim as a dependency (builtin pseudo-package; 5 libraries + the
+   tests that list it), and base carries
+   `[targets.base.cfg.linux] link-flags = { public = ["-lrt"] }`
+   (`# transcribed:` comment names the genexpr). Written from upstream's
+   build logic; S5 executes them on Linux.
 
-54 of the 93 closure targets are header-only (`config`, `core_headers`,
-`type_traits`, `span`, `optional`, `memory`, ...). v0 has no
-`interface-library`, so each is a `static-library` compiling a shared empty
-stub TU (`cppkg_stub.cc`), producing 54 empty `.a` files whose only job is
-to exist as graph nodes. Propagation (public deps/includes/defines) works
-faithfully through them, and the build cost is negligible — but it is a
-modeling lie, it spams `ranlib: no symbols` warnings, and any tool that
-inspects archives sees 54 empty libraries. The alternative workaround
-(rewriting deps to skip header-only nodes) would have destroyed the faithful
-graph. `interface-library` is the single schema addition that would have
-removed the largest hack in this port. (Abseil's CMake does not use OBJECT
-libraries outside DLL mode, so object-libraries proper went unexercised.)
-Severity: major.
+6. **29% generated repetition → `[target-defaults]`.** `cxx-std = 17` +
+   `includes = { public = ["."] }` × 93 (and the `install`/`public-headers`
+   × 93 an export would have added) collapse into one 8-line table.
+   Measured: **660 → 470 generated lines** for the same 93 library targets
+   (7.1 → 5.05 lines/target, −29% — the wave-1 prediction, exactly).
 
-## per-target-flags
+7. **Testing story ("full port impossible until it exists") → dev/test
+   markers + `[dev-dependencies]` + `cpp-pkg test`.** The generator emits
+   `dev = true` 1:1 from TESTONLY (21 libs in subset) and `test = true` per
+   `absl_cc_test` (88 executables whose closure lies inside the subset).
+   googletest v1.17.0 is a dev-dep (`find-package = "GTest"`), locked
+   eagerly, built lazily — `cpp-pkg build` stays 249 actions and touches no
+   gtest. `cpp-pkg test --jobs 8`: **88 passed, 0 failed**; filters and
+   `-- --gtest_filter=...` passthrough work. Zero `[[run]]` entries needed
+   (gtest binaries take the default invocation) — the zero-entry default is
+   the right spelling here.
 
-Two distinct sub-gaps:
+8. **Install/export cul-de-sac → `[export]` + `install = true` +
+   `public-headers` override.** Written once each:
+   `cmake-name = "absl"`, `namespace = "absl"`, default `install = true`
+   (eligibility auto-skips the 21 dev libs and 88 tests — zero per-target
+   lines), and the one total override for abseil's repo-root layout:
+   `public-headers = { base = ".", patterns = ["absl/**/*.h", "absl/**/*.inc"] }`.
+   `cpp-pkg install --prefix` stages 504 files; header set byte-matches the
+   reference CMake install (384 `.h` + 24 `.inc`); a plain CMake consumer
+   builds against OUR `abslConfig.cmake` with byte-identical demo output
+   (ROUNDTRIP-PARITY-OK). The port is a producer now.
 
-1. **Compile flags.** Every abseil target sets `COPTS ${ABSL_DEFAULT_COPTS}`
-   (a curated warning list, `-Wall -Wextra -Wcast-qual ...`). Targets have
-   no `cxx-flags` field, so these are dropped wholesale. Harmless for
-   artifact parity, fatal for "build this project the way its authors
-   intended" (warnings-as-errors projects would diverge immediately).
-2. **Link flags / frameworks.** `absl::time` carries
-   `$<$<PLATFORM_ID:Darwin,...>:-Wl,-framework,CoreFoundation>` in LINKOPTS.
-   No per-target link-flags field exists, so the framework rides on
-   `[profiles.release] link-flags` — i.e. EVERY executable in the project
-   links CoreFoundation because one library needs it, and the manifest under
-   `--config debug` silently loses it (profile-scoped, not target-scoped).
-   The extraction path handles this exact edge correctly for *imported*
-   targets (frameworks bucket); native targets deserve the same field.
+9. **Probe's unevaluated-genexpr notes (replayed on every cache hit) →
+   gone.** Tool-fix #8: `$<BOOL:...>` inside LINK_ONLY is evaluated; the
+   consumer build log carries no "unhandled generator expression" notes.
 
-Severity: major.
+10. **`.cc`-smuggled-through-HDRS (latent wave-1 bug, found by the test
+    suite).** Upstream lists `strings/internal/escaping.cc` under **HDRS**;
+    CMake compiles it anyway. Wave 1 never noticed (demo doesn't call
+    base64), the test suite linked and failed. Not a schema gap — the
+    generator now routes compilable HDRS entries to sources (same quirk
+    class as vtz's date `.cc`-in-INTERFACE_SOURCES, which got tool-fix #3
+    for the extracted side). Native default build is 249 actions (+1).
 
-## install-export — a library project cannot be a producer
+## Remaining
 
-The native port builds 93 static libraries but there is no way to
-(a) install them + headers to a prefix, or (b) export them so *another*
-cpp-pkg project could consume this port as a package (`absl::strings` etc.).
-cpp-pkg today is consumer-only: the only way to package what we just built
-is to throw the port away and consume upstream's CMake via extraction —
-which is what the consumer experiment does. For the "replace the build
-system Cargo-style" story, library authors are exactly the users who need
-`cpp-pkg install` / an export manifest. Round-trip idea from the design
-notes (emit CPS or Config shims for *local* targets) would close this.
-Severity: major (by design in v0, but abseil makes it concrete: the port is
-a cul-de-sac artifact-wise).
+### 1. NEW BUG (wave-1 feature): install/export drops private link-flags of static libraries — major
 
-Sub-gap, consumption side: the tier-2 probe runs `find_package(<depkey>)`,
-so the dep key MUST equal the CMake package name. `[dependencies.abseil]`
-fails ("Could not find abseilConfig.cmake"); the key has to be `absl`.
-`exposes-namespace` decouples target namespaces from the key, but nothing
-decouples the *config-file name* from the key. Needs a `cmake-name`/
-`config-name` field. Severity: major (workaround: rename the key; but a
-project needing two deps whose config names collide with desired keys has
-no out).
+Spec §1.3: "`link-flags` on a static library propagate link-only;
+consequence: public≡private for static-library `link-flags`". The bare-list
+spelling (all-private sugar) honors this in-project — the native demo links
+CoreFoundation fine — but **`cpp-pkg install` emission only carries the
+public bucket** (`graph.rs` `public_link_flags = eff.link_flags.public` →
+`shim.rs` `link_options`). With
+`[targets.time_zone.cfg.macos] link-flags = ["-Wl,-framework,CoreFoundation"]`
+the emitted `abslConfig.cmake` has no INTERFACE_LINK_OPTIONS, and an
+external consumer dies at link:
+`Undefined symbols: _CFTimeZoneGetName ... in libtime_zone.a`.
+The documented equivalence breaks exactly at the export boundary, silently,
+on the flag class (`-l`/`-framework` words) the interleaving rule exists
+for. Workaround (this port, generator comment marks it): spell them
+`link-flags = { public = [...] }`. Fix belongs in the tool: for
+static-library targets, fold private link-flags into the exported
+link-only channel (or reject the private spelling on installed static libs
+so the manifest can't lie).
 
-## dep-provisioning
+### 2. Header-only targets still compile a stub TU — major (scheduled: B10, wave 2)
 
-1. **No dependency patching + real-world exports contain self-edges
-   (blocker, workaround found).** Upstream ships
-   `absl::strings → absl::strings` in its own DEPS; the installed
-   `abslTargets.cmake` therefore has a self-edge in
-   INTERFACE_LINK_LIBRARIES. CMake tolerates it; cpp-pkg hard-errors:
-   `dependency cycle in link closure: absl::strings -> absl::strings`.
-   Unpatched abseil 20260526.0 is thus **unusable as a cpp-pkg dependency**.
-   Fix belongs in the tool (treat self-edges as no-ops — they are
-   idempotent, not cyclic). The only user-side out was patching the dep,
-   which cpp-pkg doesn't support either, so the workaround is a locally
-   cloned+patched+tagged repo referenced by `file://` URL (pin.sh). That
-   workaround has a nasty secondary cost: the patch commit's sha differs per
-   machine/timestamp, so the dep's config hash differs per checkout
-   (observed: `fee068f7...` vs `f4632513...`) — the store can never share
-   these entries, and the lockfile can't be committed meaningfully. A
-   first-class `patches = [...]` field (hash = base commit + patch bytes)
-   would fix both. Severity: blocker (for unpatched consumption) / major
-   (patch mechanism).
-2. **System libs via find-module results.** `absl::base` deps on
-   `Threads::Threads`; the native schema has no way to say "pthread". On
-   macOS it's folded into libSystem so dropping it works; a Linux port would
-   need it and has nowhere to put it (same for the `$<$<BOOL:${LIBRT}>:-lrt>`
-   and `$<$<BOOL:${EXECINFO_LIBRARY}>:...>` LINKOPTS). Severity: minor on
-   macOS, major the day Linux is a target.
-3. Probe-side handling of those same constructs in the *installed* export is
-   graceful: six `unhandled generator expression inside LINK_ONLY` notes
-   (`-lrt`, `-ladvapi32`, `-llog`, `-lbcrypt`, `-ldbghelp`, EXECINFO), all
-   correctly droppable on macOS since their conditions are false/NOTFOUND
-   here. But the probe records the *unevaluated* text with baked-in
-   configure-time values — on a platform where a condition is true the
-   library would be silently dropped rather than linked. Severity: minor
-   (macOS), latent-major (portability). Cosmetic sub-note: these notes are
-   replayed on every build, including cache hits.
+54 of 93 library targets are `static-library` over `cppkg_stub.cc`.
+Unchanged from wave 1, and now *worse-shaped*: the 54 empty archives are
+also **installed** into the prefix and imported as STATIC by the emitted
+Config (upstream exports them as INTERFACE libraries). Consumers link ~54
+empty archives harmlessly, but the modeling lie is now visible outside the
+build tree. interface-library is the named wave-2 item; this port is its
+first customer.
 
-## conditional-sources
+### 3. NEW ergonomics headline: per-test COPTS deltas are the next 29% — major
 
-Abseil keeps source lists platform-unconditional (variation lives in
-preprocessor guards), so the classic conditional-sources problem barely
-appeared. Where conditionality does live — LINKOPTS/DEPS generator
-expressions — the port had to bake in "macOS, Apple clang" at generation
-time. Upstream's one CMakeLists is portable; our CppPkg.toml is a
-platform-specific projection of it. Any schema answer (cfg()-style keys like
-`[targets.time.macos]`, or genexpr-lite strings) must cover link
-inputs/flags, not just sources — sources were never the problem in this
-project. Severity: minor here, but this is the mildest possible test of the
-question.
+Upstream has *two* flag environments: ABSL_DEFAULT_COPTS (all libs) and
+ABSL_TEST_COPTS (all tests). `[flags]` expresses the first; nothing
+expresses the second, so the generator emits the same 2 cfg blocks
+(~17 clang flags + 7 gcc flags) into **every one of the 88 test targets**:
+~350 lines, ~35% of the dev/test section — the same shape
+`[target-defaults]` just killed for libraries. No current feature fits:
+flag keys are reserved-out of `[target-defaults]` (pointing at `[flags]`),
+`[flags]` cannot be scoped to test targets, and there are no named
+reusable flag groups. Smallest fix consistent with the schema: a
+dev/test-scoped refinement of the package flags layer
+(e.g. `[flags.test.cfg.clang]`) — it is an environment statement, exactly
+like `[flags]`, and upstream Bazel/CMake both model it that way.
 
-## testing-story
+### 4. Windows-only LINKOPTS remain comments — minor
 
-Not attempted, by scope — but the shape of the gap is measurable: 241
-`absl_cc_test` executables + 40 TESTONLY libraries, all gated upstream on
-`BUILD_TESTING AND ABSL_BUILD_TESTING`, all depending on GoogleTest
-(provisioned upstream via `ABSL_USE_EXTERNAL_GOOGLETEST` or FetchContent).
-Porting them needs: a test target kind (or `test = true`), test-only deps
-that stay out of the normal graph, a gtest provisioning answer, and a
-runner (`cpp-pkg test`). Nothing in v0 covers any of these; the honest
-extrapolation is that a full abseil port is impossible until they exist.
-Severity: major (scoped out here, so not a blocker for this migration).
+`$<$<BOOL:${MINGW}>:-ladvapi32>` (base), `-ldbghelp` (symbolize): the cfg
+vocabulary's `windows` atom cannot distinguish MinGW from MSVC, and these
+are MinGW spellings. Left as `# not transcribed` comments (3 in the
+manifest). Out of scope until a Windows toolchain exists; recorded.
+`$<$<BOOL:${EXECINFO_LIBRARY}>:...>` (stacktrace) is genuinely empty on
+all current platforms (glibc has backtrace in libc; macOS in libSystem;
+musl lacks it entirely) — comment is the honest transcription.
 
-## codegen-escape-hatch
+### 5. Native self-edges still error — minor
 
-Genuinely unexercised: abseil has no generated sources, no configure-time
-file generation, no downloads. Zero data from this project; the question
-needs a different migration (protobuf, ICU) to bite.
+Tool-fix #2 dedupes self-edges in *extracted* manifests only; a project
+target listing itself still errors
+(`dependency cycle in link closure: strings -> strings`, verified). So the
+generator keeps stripping upstream's `absl::strings` self-dep for the
+native port. Defensible (project manifests are user-authored), but the
+asymmetry means a mechanical CMake→CppPkg converter must special-case what
+the extractor now tolerates.
 
-## Tool-bug observations (not schema gaps)
+### 6. Still-standing wave-1 ergonomics residue — minor
 
-- Self-edge = cycle (above) is arguably a manifest-resolver bug, not a
-  schema gap: CMake's own semantics dedupe self-links.
-- The upstream self-dep also had to be stripped by the *generator* for the
-  native port (`absl::strings` in its own deps would presumably trip the
-  same cycle check on native targets).
+- `type = "static-library"` × 114: `type` is deliberately excluded from
+  `[target-defaults]`; accepted, but it is now the largest per-target
+  constant left.
+- TOML still has no include mechanism: generated blocks and the
+  hand-written prologue share one 1548-line file with a marker comment
+  (`targets-from` remains deferred).
+- The generator itself remains the on-ramp at this scale — unchanged
+  verdict; wave-1 features made its *output* reviewable, not unnecessary.
+
+### 7. Scope: 88/241 tests, 93/216 libs — not a gap, a boundary
+
+The 153 unported tests need closures this subset doesn't carry
+(`random`/`log`/`flags`/`status`, benchmark-dependent tests). Nothing
+schema-shaped blocks them anymore: extending ROOTS in gen_toml.py is the
+whole job. The honest wave-1 extrapolation ("a full abseil port is
+impossible until [testing] exists") is dead; a full port is now generator
+elbow grease.
+
+### 8. Untested-by-this-machine: the Linux branches — S5's job
+
+`cfg.linux` `-lrt`, the Threads builtin's `-pthread` expansion, gcc's view
+of the `[flags.cfg.gcc]` set and of the per-test deltas (`-Wno-*` flags gcc
+only diagnoses when another warning fires) are transcribed from upstream
+logic but executed only on macOS here. Wrong guesses are S5 findings;
+absent branches would have been S4 failures — none are absent.

@@ -5,12 +5,11 @@
 #
 # Steps:
 #   1. clone ninja-build/ninja at the pinned release commit
-#   2. pre-generate gen/build/browse_py.h — the one codegen step cpp-pkg
-#      cannot express (upstream: add_custom_command running src/inline.sh);
-#      the command below is the exact upstream recipe
-#   3. copy this directory's CppPkg.toml (the source of truth) into the tree
+#   2. copy this directory's CppPkg.toml (the source of truth) into the tree
 #
-# No patches/ are applied: this migration needed zero source edits.
+# No patches/ are applied: this migration needed zero source edits. The
+# browse_py.h pre-generation step that used to live here is gone: it is a
+# real [generate] edge in CppPkg.toml since wave 1.
 set -eu
 
 REPO_URL="https://github.com/ninja-build/ninja"
@@ -28,12 +27,6 @@ if [ "$ACTUAL" != "$COMMIT" ]; then
     echo "pin.sh: HEAD is $ACTUAL, expected $COMMIT" >&2
     exit 1
 fi
-
-# Codegen workaround (see GAPS.md: codegen-escape-hatch). Same command as
-# upstream's add_custom_command; output goes under gen/ because browse.cc
-# includes "build/browse_py.h" relative to an include dir.
-mkdir -p "$DEST/gen/build"
-(cd "$DEST" && sh src/inline.sh kBrowsePy < src/browse.py > gen/build/browse_py.h)
 
 cp "$HERE/CppPkg.toml" "$DEST/CppPkg.toml"
 

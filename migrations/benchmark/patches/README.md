@@ -1,8 +1,10 @@
 # patches/
 
-Empty on purpose: the v1.9.5 migration required **zero source-tree edits**.
+Empty on purpose: the migration required **zero source-tree edits**, in both
+waves.
 
-Everything the upstream CMake build computes at configure time (git-describe
-version string, cxx_feature_check probe results, warning-flag probing) could
-be expressed as hardcoded defines/flags in `CppPkg.toml` — see `GAPS.md` for
-why each hardcoding is still gap data even though no patch was needed.
+Wave 1 expressed upstream's configure-time computation (git-describe version
+string, cxx_feature_check probe results, warning-flag probing) as hardcoded,
+macOS-only defines/flags. The wave-2 manifest expresses the same facts as
+schema surface — `${package.version}` interpolation, `cfg` transcriptions,
+`[flags]`/target flags — still with no patch. See `GAPS.md`.

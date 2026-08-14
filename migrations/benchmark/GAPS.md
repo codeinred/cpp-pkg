@@ -1,150 +1,171 @@
-# GAPS — google/benchmark v1.9.5 migration
+# GAPS — google/benchmark v1.9.5 migration, wave-2 edition
 
-Every friction point hit while porting benchmark's CMake build to
-`CppPkg.toml`, keyed to the design questions. Severity is from this
-project's perspective; "generalizes" notes why it will recur elsewhere.
+Wave 1 recorded 8 gaps. The wave-1 extensions dissolve the substance of 7 of
+them; this file records each workaround → feature mapping (verified by
+rebuilding, re-running parity, and running the full suite on macOS/arm64/
+AppleClang 21), then what honestly remains.
 
-## 1. Configure-time version stamping (codegen-escape-hatch, major)
+## Dissolved (workaround → feature)
 
-Upstream runs `git describe --tags --match "v[0-9]*.[0-9]*.[0-9]*" --abbrev=8`
-at configure time and injects the result as a per-source compile definition
-(`BENCHMARK_VERSION="v1.9.5"` on `benchmark.cc` only).
+1. **Hardcoded `BENCHMARK_VERSION="v1.9.5"`** (gap 1) →
+   `defines = { private = ['BENCHMARK_VERSION="v${package.version}"'] }`.
+   Stated once, in `[package].version`; drift-on-repin is dead. Verified the
+   strong way: `benchmark.cc.o` (the TU that embeds the string) is
+   bit-identical to the reference object produced from `git describe`. The
+   git-describe/store-strips-`.git` trap is gone with **no codegen step at
+   all** — the interpolated define was the whole need. (`${pin.self.*}` for
+   dependency-mode version stamping stays reserved; see Remaining.)
 
-- **cpp-pkg lacks**: any way to run a command at generation time and feed its
-  output into a define/generated file. Workaround: hardcoded
-  `'BENCHMARK_VERSION="v1.9.5"'` in the manifest — which now silently drifts
-  if the pin moves.
-- **Bonus finding (dependency mode)**: cpp-pkg's raw store checkout has **no
-  `.git` directory**, so in declare-as-dependency mode upstream's
-  `git describe` always fails and the build silently falls back to
-  `project(VERSION)`. Here that coincidentally yields the same `v1.9.5`; pin
-  a non-tag `rev` and the dependency reports a wrong version with no
-  warning. Any escape hatch that "just runs git" won't work inside the store;
-  the hatch needs access to lockfile facts (requested tag/rev, commit) as
-  substitutable variables — for this whole class of project,
-  `version-from = "git-tag"`-style metadata plus `${pin.tag}` substitution in
-  defines would have sufficed, no arbitrary command execution needed.
-- What the escape hatch must do for benchmark specifically: produce one
-  string at manifest-evaluation time and attach it as a define. No files
-  generated, no build-graph edges.
+2. **Transcribed macOS-only probe defines** (gap 2) → `cfg` sub-tables with
+   `# transcribed:` comments naming each upstream check:
+   - `HAVE_STD_REGEX` / `HAVE_STEADY_CLOCK`: true on every vocabulary
+     platform → unconditional `[target-defaults]` private defines (global
+     upstream via `add_compile_definitions`; test TUs include `src/re.h` and
+     must agree on the regex backend).
+   - `HAVE_THREAD_SAFETY_ATTRIBUTES`: compiler-conditional, not
+     OS-conditional → `cfg.clang` blocks (defining it under gcc would
+     -Werror on the clang-only attributes).
+   - `BENCHMARK_HAS_PTHREAD_AFFINITY` + `-lrt`:
+     `[targets.benchmark.cfg.linux]` defines/link-flags — the Linux branch
+     written from upstream's build logic (probe TRUE on glibc,
+     `check_library_exists(rt shm_open)` TRUE), awaiting S5 validation.
+   - `shlwapi.lib`: `[targets.benchmark.cfg.windows]` link-flags,
+     accepted-but-false here, validated-not-expanded as spec'd.
 
-## 2. Compile/run feature probes (codegen-escape-hatch, major)
+3. **No per-target flags** (gap 3) → three surfaces, all used:
+   - warning battery + visibility preset: duplicated
+     `[profiles.release]`/`[profiles.debug]` stanzas deleted → one `[flags]`
+     block + `[flags.cfg.clang]` for `-Wshorten-64-to-32`/`-Wthread-safety`
+     (upstream probes flags per compiler; with `-Werror` in the battery an
+     unconditional block would hard-break gcc).
+   - test-dir `-Wno-unused-variable`: private `cxx-flags` on the test
+     targets it belongs to. **Wave 1's global `-Wno-unused-but-set-variable`
+     deviation is deleted outright** — with upstream's own suppression in
+     its proper scope, nothing else was needed; the whole suite compiles
+     under the full `-Werror` battery with zero added suppressions.
+   - `donotoptimize_test` `COMPILE_FLAGS "-O3"` +
+     `-Werror=deprecated-declarations`: private target flags, overriding the
+     profile's level by documented last-wins layering.
+   - `-Wsuggest-override` correctly dropped (upstream adds it only with
+     testing OFF; this manifest carries the suite).
 
-`cxx_feature_check(STD_REGEX / GNU_POSIX_REGEX / POSIX_REGEX / STEADY_CLOCK /
-PTHREAD_AFFINITY / THREAD_SAFETY_ATTRIBUTES)` try_compile/try_runs tiny
-programs and turns successes into global `-DHAVE_*` defines; also
-`check_library_exists(rt shm_open)` gates `-lrt`.
+4. **Hand-listed 19 sources / no conditionals** (gap 4) →
+   `sources = ["src/*.cc", "!src/benchmark_main.cc"]` (upstream's
+   glob-minus-one restored; new upstream files are now picked up instead of
+   becoming silent link errors) + the `cfg` branches above. Solaris `kstat`
+   stays out-of-vocabulary (see Remaining).
 
-- **cpp-pkg lacks**: any probe mechanism. Workaround: ran the reference CMake
-  configure once, transcribed the macOS/arm64 outcome (`HAVE_STD_REGEX`,
-  `HAVE_STEADY_CLOCK`, `HAVE_THREAD_SAFETY_ATTRIBUTES`; PTHREAD_AFFINITY and
-  rt absent) as literal private defines.
-- Consequence: the manifest is **platform-specific**. The same TOML is wrong
-  on Linux (needs `HAVE_PTHREAD_AFFINITY`, possibly `rt`) — and there is no
-  conditional syntax to even express "on Linux add X" (overlaps gap 4).
-  Probes select the regex *backend source semantics* here, but in other
-  projects they select source files outright.
-- Note: these probes are the moral equivalent of Cargo's `build.rs` +
-  `cfg`; the schema will keep meeting them in every autotools/CMake-heritage
-  codebase.
+5. **Test suite inexpressible** (gap 5) → fully ported:
+   - googletest: `[dev-dependencies]` with upstream's own bundled pin
+     (`v1.15.2`, `find-package = "GTest"`). Locked eagerly (in
+     `CppPkg.lock`), fetched/built only by `cpp-pkg test` — a library-only
+     `cpp-pkg build` does no store work for it (verified).
+   - `output_test_helper`: `dev = true` static library (the "output-checked
+     tests" wave 1 wrote off are self-verifying binaries; they ported as
+     ordinary test targets — nothing remained out of scope there).
+   - 49 `test = true` executables, 84 `[[run]]` entries transcribed 1:1 from
+     upstream's CTest registrations, including the 36-invocation
+     `filter_test` matrix with positional expect-count args and empty-string
+     `--benchmark_filter=` args.
+   - `-UNDEBUG` rides in private `cxx-flags` (no schema home for an
+     un-define — draws the documented lint warning, works via last-wins over
+     the profile's `-DNDEBUG`), plus
+     `TEST_BENCHMARK_LIBRARY_HAS_NO_ASSERTIONS`.
+   - Result: `cpp-pkg test` 84 passed / 0 failed; reference `ctest` on the
+     same checkout: 84 tests, 100% pass. Filters and the
+     no-match hard error behave as spec'd.
 
-## 3. No per-target / per-source flags (per-target-flags, major)
+6. **No install/export** (gap 6) → `install = true` (via `[target-defaults]`
+   eligibility: fills exactly `benchmark` + `benchmark_main`, skips all 50
+   dev/test targets), `[export] cmake-name = namespace = "benchmark"`
+   (upstream's names). Headers derive from `includes.public`. The wave-1
+   fixpoint test passes: plain CMake `find_package(benchmark 1.9.5)` against
+   the cpp-pkg-installed prefix builds and runs a consumer reporting
+   `v1.9.5` (SameMajorVersion ConfigVersion honored).
 
-Upstream flag structure that cpp-pkg cannot express:
+7. **No way to say "system threads"** (gap 7) → `Threads::Threads` builtin
+   (ladder step 0): declared private on `benchmark` and on every test target
+   upstream links `${CMAKE_THREAD_LIBS_INIT}` into. No-op on macOS by
+   definition; `-pthread` on Linux comes with the S5 run.
 
-- Warning battery (`-Wall … -Werror -pedantic-errors -Wthread-safety`) and
-  visibility preset (`-fvisibility=hidden -fvisibility-inlines-hidden`) are
-  directory-global for the library, but the `test/` directory *adds*
-  suppressions (`add_cxx_compiler_flag(-Wno-unused-variable)`) and single
-  tests override options (`donotoptimize_test`: `COMPILE_FLAGS "-O3"` +
-  `-Werror=deprecated-declarations`).
-- Per-source define: `BENCHMARK_VERSION` is attached to `benchmark.cc` only
-  via `set_property(SOURCE … COMPILE_DEFINITIONS)`.
-- `-Wsuggest-override` is added only when testing is off (option-conditional
-  flag).
+8. **Schema ergonomics** (gap 8) → profile-stanza duplication gone
+   (`[flags]`); `cxx-std = 17` and the large-file defines stated once in
+   `[target-defaults]` (with `cxx11_test` overriding the scalar, as spec'd).
 
-**cpp-pkg has**: `defines` per target (with visibility) but **no `cxx-flags`
-on targets at all** — flags exist only on profiles, applied to every consumer
-target identically. Workarounds used: (a) warning battery moved into profile
-`cxx-flags`; (b) `-Wno-unused-but-set-variable` (needed only by
-`test/basic_test.cc` under AppleClang 21 `-Werror`) applied globally —
-documented deviation; (c) per-source version define widened to
-target-private (safe here: consumed by one `#ifdef`).
+## Remaining
 
-Minimal fix that would have covered everything here: `cxx-flags` on targets
-(private/public split like `defines`). Per-source properties were only needed
-for the version define, which gap 1's fix subsumes.
+1. **Directory-scoped test facts repeat per target** (minor, ergonomics).
+   Upstream states `-Wno-unused-variable`, `-UNDEBUG`,
+   `TEST_BENCHMARK_LIBRARY_HAS_NO_ASSERTIONS` and (on clang)
+   `HAVE_THREAD_SAFETY_ATTRIBUTES` once for the `test/` directory; the
+   manifest repeats them in all 50 dev-target stanzas (~200 lines of the
+   906) because `[target-defaults]` excludes flag keys (reserved, by design)
+   and `[target-defaults.cfg.*]` is reserved. Not wrong — the manifest is
+   generated-then-committed — but this is the single largest source of bulk,
+   and any project with a test-dir flag policy will meet it. A scoped
+   defaults mechanism (or unreserving flag keys in defaults) would collapse
+   it.
 
-## 4. Conditional sources / platform conditionals (conditional-sources, major)
+2. **Global compiler-conditional defines have no single home** (minor).
+   `HAVE_THREAD_SAFETY_ATTRIBUTES` is global upstream
+   (`add_compile_definitions`) but must be spelled per target here since
+   `[target-defaults.cfg.clang]` is reserved. Same shape as (1); recorded
+   separately because it is `cfg`-specific: the first project needing a
+   *platform*-conditional global define (this one is compiler-conditional)
+   hits it too.
 
-- Upstream computes `SOURCE_FILES` = `glob(src/*.cc)` **minus**
-  `benchmark_main.cc`. cpp-pkg globs have no exclusion syntax → 19 files
-  listed by hand (drift hazard when upstream adds a file: silently missing
-  symbol at link, not a manifest error). Wanted: `sources = ["src/*.cc",
-  "!src/benchmark_main.cc"]` or similar.
-- Platform-conditional link libs/defines have no home: `shlwapi` (Windows),
-  `kstat` (Solaris), `rt` (Linux), `-D_GNU_SOURCE` (Cygwin), MSVC vs GCC
-  flag branches. The manifest can only encode one platform's truth; there is
-  no `[target.'cfg(...)']`-style select. For a *macOS-only* migration this
-  cost nothing, which is exactly why it's easy to underestimate.
+3. **Profile-conditional test defines inexpressible** (minor, correctness at
+   the margin). Upstream scrubs `-DNDEBUG` and defines
+   `TEST_BENCHMARK_LIBRARY_HAS_NO_ASSERTIONS` only for non-Debug configs.
+   The manifest transcribes the release branch; a `--config debug` test run
+   still gets `-UNDEBUG` (harmless — nothing to undefine) but wrongly keeps
+   `TEST_BENCHMARK_LIBRARY_HAS_NO_ASSERTIONS`. `[profiles.*.cfg.*]` is
+   reserved and cfg has no profile axis, deliberately. Debug-config test
+   runs of this port are therefore slightly off-upstream (assertion-related
+   expectations in `donotoptimize_test`/`diagnostics_test` could diverge).
 
-## 5. Test suite inexpressible (testing-story, major — scope reduction)
+4. **Exporting a header-less companion library trips the empty-derivation
+   error** (minor, new-feature finding). `benchmark_main` has no headers of
+   its own; `install = true` hard-errored ("header derivation is empty")
+   until it was given `includes = { public = ["include"] }`. That spelling
+   is defensible here — upstream's `install(TARGETS ... INCLUDES DESTINATION
+   include)` puts `include/` on both exported targets' interfaces, and the
+   derived headers dedupe byte-equal — but a companion library whose
+   interface is purely "link me" (its headers all owned by a dep) has no
+   honest spelling: the error's third suggestion ("remove install = true")
+   would un-ship it. An explicit empty override
+   (`public-headers = { patterns = [] }`) is currently a schema error too.
+   Worth a ruling: header-less exported libraries are real (every
+   `foo_main`-style lib).
 
-Not migrated (equivalent to `BENCHMARK_ENABLE_TESTING=OFF`):
+5. **`-UNDEBUG` lint noise** (cosmetic). The documented
+   `cxx-flags contains '-UNDEBUG'` warning fires once per test target — 50
+   times per build. Correct per spec (warn, don't error), but at this
+   multiplicity a once-per-flag summary would be kinder.
 
-- **Test-only dependency**: googletest, either bundled-downloaded
-  (`BENCHMARK_USE_BUNDLED_GTEST` via ExternalProject at configure time) or
-  `find_package(GTest)`. cpp-pkg has no dev-dependencies section, so
-  declaring gtest would poison the production dependency closure.
-- **Runner**: ~40 CTest registrations (some with `--benchmark_min_time=0.01`
-  args, output-checked "output tests"); no `cpp-pkg test` exists.
-- **Per-test build tweaks**: tests scrub `-DNDEBUG` in release
-  (`add_definitions(-UNDEBUG)` — an *un*-define, also inexpressible),
-  per-test flags (gap 3), and a `TEST_BENCHMARK_LIBRARY_HAS_NO_ASSERTIONS`
-  define.
-- What was salvageable without any of that: `test/basic_test.cc` compiles as
-  a plain executable target and doubles as the smoke benchmark — that is the
-  only fraction of the suite reachable today.
+6. **Dependency-mode version trap half-remains** (recorded, unchanged).
+   Source-mode version stamping is fixed by interpolation, but a *consumer*
+   pinning benchmark at a non-tag `rev` still gets whatever
+   `project(VERSION)` says (the store checkout has no `.git`, upstream's
+   `git describe` fails silently). `${pin.self.requested}` would let a
+   future CppPkg-native dep mode fix this; reserved today.
 
-## 6. No install/export story (install-export, major)
+7. **Recorded losses, unchanged and deliberate**: `.pc` file emission
+   (upstream ships `benchmark.pc`/`benchmark_main.pc` with a derived
+   `Libs.private`), python tools (`share/googlebenchmark/tools`) and docs
+   installs; Solaris `kstat` (out of cfg vocabulary); assembly tests
+   (upstream gates them off on this machine anyway); per-case gtest
+   discovery (`gtest_discover_tests` has no analogue — each gtest binary is
+   one invocation, same as upstream's `add_gtest` here, so no fidelity lost
+   for benchmark specifically).
 
-Upstream installs: both archives (with `VERSION`/`SOVERSION` properties),
-headers, `benchmarkConfig.cmake` + version file + targets export,
-`benchmark.pc`/`benchmark_main.pc` (with a derived `Libs.private` line), and
-python tools. The cpp-pkg source-mode build produces `build/libbenchmark.a`
-et al. and **stops** — no `cpp-pkg install`, no way to emit a config/CPS
-file for the targets this manifest defines. Consequence observed directly:
-the only way to let another project consume this migration is to *not use
-the migration* and declare upstream as a CMake dependency instead (which is
-what `consumer/` does). A manifest-driven `install`/`package` command
-emitting CPS or a Config.cmake from the target graph would close the loop —
-and the round-trip (cpp-pkg-built benchmark consumed via cpp-pkg extraction)
-is a natural fixpoint test.
+## Verification summary (macOS arm64, AppleClang 21)
 
-## 7. System libraries / Threads (dep-provisioning, minor here)
-
-Upstream links `Threads::Threads` (PRIVATE). On macOS pthreads live in
-libSystem so omitting it is *correct on this platform only* — the manifest
-has no way to say "system threads" (or `-pthread` where required), so a
-Linux port would need to smuggle `-pthread` through profile flags. Same
-shape as the `rt` case in gap 2. A small vocabulary of well-known system
-capabilities (`threads`, `dl`, `m`, `rt`) would cover most of what CMake
-find-modules provide here. Notably the *dependency* mode has no such
-problem: the installed config's `find_dependency(Threads)` runs inside the
-probe and the resulting interface came through cleanly.
-
-## 8. Schema ergonomics (schema-ergonomics, minor)
-
-- **Profile flag duplication**: identical 20-flag `cxx-flags` lists pasted
-  into `[profiles.release]` and `[profiles.debug]` because flags common to
-  all profiles have no home (`[profiles.all]`? top-level `cxx-flags`?).
-- **Repeated `cxx-std = 17`** on every target; a `[package]`-level default
-  (upstream's `CMAKE_CXX_STANDARD`) would remove three copies.
-- **Quoted define values worked first try** (`'BENCHMARK_VERSION="v1.9.5"'`
-  survived TOML → ninja → shell intact and matched CMake's escaping) — worth
-  a doc example, since it's the thing a migrator is least sure about.
-- **Good news data point**: the whole port needed zero patches and the
-  build-graph part of the schema (visibility splits, static-lib private
-  propagation, bare-list sugar) mapped 1:1 onto upstream's structure; every
-  gap above is about what *surrounds* the target graph (probes, codegen,
-  tests, install), not the graph itself.
+- Objects bit-identical to reference (5 TUs incl. version-embedding
+  `benchmark.cc.o`); `nm -g` archive symbol lists identical (811 symbols).
+- `cpp-pkg test`: 84/84 pass; reference `ctest`: 84/84 pass; invocation
+  lists match 1:1.
+- `cpp-pkg install`: 7 files; plain-CMake fixpoint consumer green.
+- Second build/test/consumer-build: full no-ops (store + ninja cache hits).
+- Linux/Windows branches written from upstream logic, validated here,
+  pending S5 execution.

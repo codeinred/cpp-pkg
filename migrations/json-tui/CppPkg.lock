@@ -3,9 +3,9 @@ schema-version = 1
 
 [[package]]
 name = "args"
-source = "url+https://github.com/Taywee/args/archive/114200a9ad5fe06c8dea76e15d92325695cf3e34.tar.gz"
-requested = "sha256:c97c70a1451873688a62d96ed42a2dcf14bb695072fe6ab9bade3e4b57c50dfd"
-content-hash = "blake3:2dadc06093fff537cd9eb5765adb74f980ae8bf238a838c2a4f6a292e83409fc"
+source = "git+https://github.com/Taywee/args"
+requested = "rev:114200a9ad5fe06c8dea76e15d92325695cf3e34"
+commit = "114200a9ad5fe06c8dea76e15d92325695cf3e34"
 
 [[package]]
 name = "ftxui"
@@ -21,6 +21,6 @@ commit = "23ef29555ef4789f555f1ba8c51b4c52975f0907"
 
 [[package]]
 name = "nlohmann_json"
-source = "url+https://github.com/nlohmann/json/archive/refs/tags/v3.12.0.tar.gz"
-requested = "sha256:4b92eb0c06d10683f7447ce9406cb97cd4b453be18d7279320f7b2f025c10187"
-content-hash = "blake3:49337bc7bf6f77c878c0e55b956bdc680eb9a3af4511cc18dae15ecba82770f1"
+source = "url+https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz"
+requested = "sha256:42f6e95cad6ec532fd372391373363b62a14af6d771056dbfc86160e6dfff7aa"
+content-hash = "blake3:1a9f18d6b8c7a23de44179599c8c8e80fa0ae21c15487257fcd49bf72e643eaf"
