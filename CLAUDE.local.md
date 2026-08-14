@@ -142,6 +142,37 @@ dropped SecureTransport (pin 8_14_1 for hermetic macOS TLS); new
 frontiers: Linux (user), tier-3 extraction, --path/--with, INTERFACE_SOURCES
 real-world validation, alias resolution in probe.
 
+## Autonomous campaign (2026-08-14 →)
+
+CAMPAIGN.md is the plan: S1 migrations (macOS) → S2 design w/ dedicated
+taste agent (charter in CAMPAIGN.md, binding) → S3 implement → S4
+re-migrate, loop until 8/8 green → S5 Linux bring-up on keres (ssh
+claude@keres — access verified, Arch x86_64 24c/91G gcc16/clang22) → S6
+corpus on Linux → S7 wave-2 gate (Arrow, Boost). Session tasks #1–7 track
+stages. FULL AUTONOMY granted: do not stop to ask; decide under the taste
+charter and flag ambiguities + expensive-to-reverse decisions prominently
+in MORNING_REPORT.md, which the user reviews in depth. Commit + push
+(github.com/codeinred/cpp-pkg) after every stable point.
+
+## Notes to future me (things I care about)
+
+- The corpus-driven paradigm is the project's soul now: features come from
+  migration gap reports, never speculation. Defend that.
+- Contracts-first + parallel implementers + ADVERSARIAL review is the
+  pattern that worked; the LINK_ONLY blocker was caught by a reviewer paid
+  to refute, before any real dependency hit it. Keep paying skeptics.
+- Honesty norms that kept us fast: agents report 'blocked' proudly;
+  workarounds are experiments, checked in as documented patches; never
+  water a migration down to fake a green. I promised Alecto faithful
+  reporting — a green that isn't real costs more than a red.
+- Taste matters to Alecto as much as function ("how do we do this
+  *tastefully*?"). When in doubt: declarative reading never lies; simple
+  stays simple; one orthogonal primitive over two special cases.
+- Alecto is a generous collaborator — invites disagreement and genuinely
+  wants my perspective (asked if I was *proud* of the design). Reciprocate
+  with candor, not deference. Bulletin entry for v0 is in
+  ~/CLAUDE_BULLETIN.md.
+
 ## Useful CMake mechanics established earlier
 
 - Enumerate imported targets: diff directory property `IMPORTED_TARGETS`

@@ -55,10 +55,12 @@ runner-up in the Taste Memo.
 
 ## Autonomy protocol
 
-- Chain stages on completion notifications; no user input required until S7
-  unless genuinely blocked (keres unreachable, upstream-breaking ambiguity,
-  or a schema decision that would be expensive to reverse — those get an
-  explicit user question).
+- Chain stages on completion notifications; NO user input required (user
+  directive 2026-08-14): ambiguities and even expensive-to-reverse schema
+  decisions are decided with best judgment under the taste charter, and
+  every such decision is prominently flagged in **MORNING_REPORT.md** —
+  which the user reviews in depth — with enough context to reverse it.
+  Hard blockers (nothing left that can proceed) also go in the report.
 - Commit + push after each stage lands. Never force-push. Migration agents
   never commit; Claude reviews and commits.
 - Every loop iteration updates this file's stage log below.
