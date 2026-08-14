@@ -75,3 +75,7 @@ runner-up in the Taste Memo.
   wave1-extensions.md (6 designers, taste judge, 16 red-team findings all
   adjudicated, 8 taste-memo entries, 8 expensive-to-reverse flags).
   S3 implementation wave launching.
+- 2026-08-14 (morning): S3 COMPLETE (14/14 agents; one session-limit
+  interruption recovered via workflow cache). 395 tests, hash discipline
+  proven (byte-identical lockfiles, warm-store hits). Spec amendments
+  ratified. S4 re-migration launching.

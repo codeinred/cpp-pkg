@@ -22,6 +22,20 @@ vtz 774/774 tests incl. death tests; cppcheck byte-identical --errorlist;
 benchmark bit-identical object files. S2 (design round with taste agent)
 launched.
 
+## Executive summary — S3 (implementation) complete
+
+Wave-1 extensions are IMPLEMENTED: cfg conditionals, [flags] + per-target
+flags with the propagation fence, dev/test markers + [[run]] + `cpp-pkg
+test`, two-tier [generate] + `gen`/`gen --check` (with a best-effort network
+sandbox), patches (hash-spine package ids), system deps, [target-defaults],
+glob negation, runtime-data staging, `cpp-pkg install`, export fixpoint.
+395 tests (was 187 at v0), clippy clean, four test projects green with
+warm-store cache hits and BYTE-IDENTICAL lockfiles — the no-invalidation
+hash rule held. Session limit interrupted the fix pass mid-wave; resumed
+from workflow cache, zero work lost (checkpoint c1e1980, final 333771c).
+Release notes owed: one-time whole-project relink (link argv order);
+transported-ABI re-key note. S4 re-migration launched.
+
 ## Decisions needing your review (expensive to reverse — flagged, not blocked)
 
 From the S2 design round (full spec: `docs/design/wave1-extensions.md`,
@@ -62,6 +76,13 @@ status NORMATIVE for S3; candidates preserved under
   - alternative that lost: Hard error on exporting any patched-dep closure (would make vtz's primary use case unexportable)
 
 ## Ambiguities resolved by judgment
+
+- S3 fix pass upheld 3 reviewer-flagged deviations, which I ratified as
+  architect (spec Amendments section): SDK-sysroot hermeticity exemption
+  (hash-covered by sdk_version; load-bearing for FindZLIB SDK .tbd), lazy
+  url-dep locking (sha256 already pins), and the corrected §0.3
+  interpolation-position table. Two deliberate open holes tracked:
+  response-file flag laundering; per-config build dirs.
 
 - S2 red team filed 16 findings against the chosen spec; all adjudicated,
   15 produced in-place spec fixes, 1 upheld as an explicit logged decision
