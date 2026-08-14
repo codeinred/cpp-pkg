@@ -15,12 +15,21 @@ three-tier ladder:
 Two on-disk stores: raw download store, and a content-addressed artifact store
 keyed on (package hash, build configuration).
 
-## Documents
+## Documents & repo conventions
 
 - `CPP_PKG.md` — concept/design doc (user-authored).
-- `CPP_PKG_IMPLEMENTATION.md` — implementation decision log, maintained by
-  Claude at the user's request. Record new implementation decisions there
-  (statuses: Decided / Leaning / Open); edit superseded decisions in place.
+- `CPP_PKG_IMPLEMENTATION.md` — strategic implementation decision log,
+  maintained by Claude (statuses: Decided / Leaning / Open); edit superseded
+  decisions in place.
+- `DESIGN_CHOICES.md` — fine-grained running log of concrete choices
+  (especially Claude's autonomous ones, with rationale/oracle verdicts).
+  **Must be committed whenever updated** (user instruction).
+- Repo is git (user-initialized, branch `main`); user commits under
+  "Alecto Irene Perez". `CLAUDE.local.md` is deliberately force-added/tracked
+  here as a cross-instance continuity doc. `answers.txt` is the user's
+  message-drafting scratch — leave untracked, don't delete.
+- For contested design questions, spawn a subagent as an oracle and record
+  the verdict in DESIGN_CHOICES.md (user instruction, 2026-08-13).
 
 ## Direction decisions (2026-08-13, from user)
 

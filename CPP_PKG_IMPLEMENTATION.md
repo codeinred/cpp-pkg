@@ -216,6 +216,52 @@ Established CMake techniques the extractor is built on:
 
 ---
 
+## 10. Road to prototype — open questions (2026-08-13)
+
+**Resolved 2026-08-13:** the user ruled on these; rulings and the remaining
+open items now live in `DESIGN_CHOICES.md` (the fine-grained running log).
+The list below is kept for historical context; Claude's original
+recommendations in parentheses.
+
+**Scope (blocks everything):**
+- Vertical slice definition (one executable + one git-fetched CMake dep,
+  end-to-end through `cppkg build`)
+- Platform/dialect (macOS arm64, GNU driver only; MSVC deferred)
+- Extraction tier for v0 (tier 2 first; tier 3 next; tier 1 ~free after CPS)
+- Configs (single config, Release; per-config plumbing in data model only)
+- Dep linkage (static by default in v0; defers store-rpath question)
+
+**`CppPkg.toml` schema (user must rule):**
+- Target kinds + fields for v0 (executable, static-library; globs allowed?)
+- Dependency reference syntax (git+tag/rev or url+hash, per-dep `options`
+  table, consume targets by extracted name e.g. `fmt::fmt`)
+- **Transitive deps policy**: user declares full closure in v0; unsatisfied
+  `find_dependency` is a clear error; no solver/registry — how is the A→B
+  edge declared/discovered?
+- Toolchain selection UX (auto-detect PATH `c++`, `[toolchain]` override)
+
+**Pipeline mechanics (Claude can decide + build):**
+- Probe→Rust handoff (probe writes intermediate JSON per config via
+  `file(GENERATE)` incl. genex flattening w/ TARGET arg; Rust → CPS)
+- Frozen v0 list of probed target properties
+- CPS field mapping + vendor-extension names (verify against actual spec
+  before writing manifest structs — INTERFACE_SOURCES, tier-3 paths)
+- Store concretes: root dir, blake3, config-hash canonicalization, coarse
+  locking
+- Lockfile file format exists from day one (commit + content hash);
+  verification behavior may lag
+
+**Build backend:**
+- Shell out to system ninja + cmake in v0; CMake floor ≥ 3.24 globally
+- Build dir layout (`.cppkg/`), unconditional build.ninja regen in v0
+- C sources allowed alongside C++; modules explicitly deferred
+
+**Deferred (recorded, not open):** version solving (none by design), store
+GC, Windows/MSVC, multi-config generators, provider mode + shim emission +
+round-trip test, shared-lib rpath, cross-compilation.
+
+---
+
 *Maintained by Claude across sessions; see `CLAUDE.local.md` for continuity
 notes. When a decision here changes, edit it in place and note the
 supersession rather than appending a contradicting entry.*
