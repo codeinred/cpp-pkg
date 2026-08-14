@@ -126,7 +126,8 @@ into `CPPKG_TOML.md` (now normative):
 
 ## 2026-08-13 — Implementation kickoff choices (Claude)
 
-- **Crate layout:** single crate, bin `cpp-pkg` + lib `cppkg`, edition 2021;
+- **Crate layout:** single crate, bin `cpp-pkg` + lib `cppkg`, edition 2024
+  (user instruction);
   module contracts frozen in stubs (src/*.rs doc comments are normative for
   implementers). Deps pre-declared in Cargo.toml; agents may not edit it.
 - **Probe wire format:** record-oriented text (\x1E record sep, \x1F field

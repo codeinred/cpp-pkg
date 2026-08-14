@@ -1,7 +1,7 @@
 [package]
 name = "cpp-pkg"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "A C++ package manager and build system that consumes CMake-based dependencies"
 
 [[bin]]
