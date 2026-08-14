@@ -69,3 +69,5 @@ runner-up in the Taste Memo.
 
 - 2026-08-14: Campaign created. S1 running (workflow wf_890ef994-46c).
   keres access verified.
+- 2026-08-14 (late): S1 COMPLETE — 8/8 green on macOS, BACKLOG.md ranked
+  (12 gaps, 5 sketches). Committed + pushed. S2 design round launched.
